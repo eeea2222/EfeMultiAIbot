@@ -1,0 +1,8 @@
+# EfeMultiAIbot — Python Bağımlılıkları
+# pip install -r requirements.txt
+
+flask>=3.0.0
+requests>=2.31.0
+gunicorn>=22.0.0
+Pillow>=10.0.0    # Görsel thumbnail oluşturmak için (opsiyonel ama önerilir)
+Werkzeug>=3.0.0   # secure_filename ve diğer yardımcılar (Flask'ın bağımlılığı)
