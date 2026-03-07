@@ -407,8 +407,19 @@ Bu proje aşağıdaki açık kaynak proje ve kütüphaneler sayesinde mümkün o
 > Bu projelerin geliştiricilerine ve açık kaynak topluluğuna teşekkürler! ❤️
 
 ---
+## ⚠️ Bildiri (Disclaimer)
 
-## �📄 License
+> **Bu proje eğitim ve kişisel kullanım amaçlıdır.**
+
+- Bu yazılım **"olduğu gibi"** (as-is) sunulmaktadır. Yazar, yazılımın kullanımından doğabilecek herhangi bir zarardan **sorumlu değildir**.
+- WhatsApp botu, [whatsapp-web.js](https://github.com/pedroslopez/whatsapp-web.js) kütüphanesini kullanır. Bu kütüphane WhatsApp'ın **resmi olmayan** bir API'sidir. Kullanımı WhatsApp'ın [Hizmet Şartları](https://www.whatsapp.com/legal/terms-of-service)'na aykırı olabilir. **Hesap askıya alma riski kullanıcıya aittir.**
+- Bu yazılımı **spam, taciz, izinsiz veri toplama** veya yasalara aykırı herhangi bir amaçla kullanmak **kesinlikle yasaktır**.
+- LLM (Büyük Dil Modeli) çıktıları her zaman doğru olmayabilir. Yapay zeka yanıtlarını **doğrulamadan kritik kararlarda kullanmayın**.
+- Kullanıcı verilerinin (sohbet geçmişi, yüklenen dosyalar) güvenliği tamamen **sunucu yöneticisinin sorumluluğundadır**.
+
+---
+
+## 📄 License
 
 MIT License — Copyright © 2026 **Efe Aydın**
 
