@@ -2632,7 +2632,7 @@ def start_server_route():
                     if r.status_code == 200:
                         _log(f"✓ LLM hazır → http://127.0.0.1:{port}", 'ok')
                         return
-                except: pass
+                except Exception: pass
             _log("LLM zaman aşımı!", 'err')
 
         threading.Thread(target=_read,       daemon=True).start()
@@ -2647,7 +2647,7 @@ def stop_server_route():
         if _llm_proc and _llm_proc.poll() is None:
             _llm_proc.terminate()
             try: _llm_proc.wait(timeout=5)
-            except: _llm_proc.kill()
+            except Exception: _llm_proc.kill()
         _llm_status["running"] = False
     _log("LLM durduruldu.", 'warn')
     return jsonify({"ok": True})
@@ -3119,30 +3119,36 @@ def webchat_chat_route():
                     env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
                 )
 
-                # GUI açılması için kısa gecikme
-                _time.sleep(1.5)
-
-                img_b64 = None
                 try:
-                    sc = subprocess.run(
-                        ["cosmic-screenshot", "--interactive=false",
-                         "--modal=false", "--notify=false", "-s", "/tmp"],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    img_path = sc.stdout.strip()
-                    if img_path and os.path.exists(img_path):
-                        with open(img_path, "rb") as bf:
-                            img_b64 = base64.b64encode(bf.read()).decode('utf-8')
-                        os.unlink(img_path)
-                except Exception:
-                    pass
+                    # GUI açılması için kısa gecikme
+                    _time.sleep(1.5)
 
-                try:
-                    stdout, stderr = proc.communicate(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    stdout, stderr = proc.communicate()
-                    stderr += "\n\n[Timeout: 10s sonra zorla durduruldu]"
+                    img_b64 = None
+                    try:
+                        sc = subprocess.run(
+                            ["cosmic-screenshot", "--interactive=false",
+                             "--modal=false", "--notify=false", "-s", "/tmp"],
+                            capture_output=True, text=True, timeout=5
+                        )
+                        img_path = sc.stdout.strip()
+                        if img_path and os.path.exists(img_path):
+                            with open(img_path, "rb") as bf:
+                                img_b64 = base64.b64encode(bf.read()).decode('utf-8')
+                            os.unlink(img_path)
+                    except Exception:
+                        pass
+
+                    try:
+                        stdout, stderr = proc.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        stdout, stderr = proc.communicate()
+                        stderr += "\n\n[Timeout: 10s sonra zorla durduruldu]"
+                finally:
+                    # Ensure subprocess is cleaned up even if an unexpected error occurs
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.communicate()
 
                 text_out = f"✅ Kod kaydedildi ve çalıştırıldı: {path.name}\n── Çıktı ──\n{stdout}"
                 if stderr.strip():
