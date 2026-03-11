@@ -2823,7 +2823,8 @@ def save_message_route():
         return jsonify({"ok": False, "error": f"Geçersiz rol: {role}"}), 400
     try:
         mm.save_message(chat_id, role, content)
-        mm.record_contact_message(chat_id)
+        if role == 'user':
+            mm.record_contact_message(chat_id)
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -3100,9 +3101,9 @@ def webchat_chat_route():
                 expr_str = t.get("expr", "")
                 for blocked in ("__", "import", "exec", "eval", "open", "os.", "sys.", "getattr", "setattr"):
                     if blocked in expr_str:
-                        return f"❌ Güvensiz ifade: '{blocked}' kullanılamaz"
+                        return {"text": f"❌ Güvensiz ifade: '{blocked}' kullanılamaz"}
                 res = eval(expr_str, {"__builtins__": {}}, allowed)
-                return f"✅ Hesap Sonucu: {res}"
+                return {"text": f"✅ Hesap Sonucu: {res}"}
             elif name == "sandbox":
                 import werkzeug.utils, subprocess, os, time as _time, base64
                 user_dir = SANDBOX_DIR / werkzeug.utils.secure_filename(uid)
