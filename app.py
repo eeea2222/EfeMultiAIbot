@@ -1405,6 +1405,12 @@ class BotMonitor:
 #  FLASK UYGULAMASI
 # ═══════════════════════════════════════════════════════════════
 
+# llama-server durumu (Flask app tanımından önce başlatılmalı)
+_llm_proc: Optional[subprocess.Popen] = None
+_llm_queue: queue.Queue = queue.Queue(maxsize=1000)
+_llm_status = {"running": False, "pid": None, "port": 8080}
+_llm_lock   = threading.Lock()
+
 app  = Flask(__name__)
 mm   = MemoryManager()
 bot  = BotMonitor(str(APP_DIR/"whatsapp_bot.js"), str(APP_DIR))
@@ -1427,12 +1433,6 @@ def _check_api_key():
     if key != PANEL_API_KEY:
         return jsonify({"ok": False, "error": "Yetkisiz erişim"}), 401
 
-# llama-server durumu
-_llm_proc   = None
-_llm_queue: queue.Queue = queue.Queue(maxsize=1000)
-_llm_status = {"running": False, "pid": None, "port": 8080}
-_llm_lock   = threading.Lock()
-
 # ─────────────────────────────────────────────────────────────
 #  HTML PANEL
 # ─────────────────────────────────────────────────────────────
@@ -1441,7 +1441,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>LLaMA · Ultimate Panel</title>
+<title>EfeMultiAIbot</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;600;700&family=IBM+Plex+Sans:wght@300;400;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
@@ -1965,8 +1965,8 @@ input:checked+.slider:before{transform:translateX(14px)}
   </div>
   <div id="messages">
     <div class="welcome" id="welcome">
-      <div class="welcome-big">🦙</div>
-      <div class="welcome-title">LLAMA ULTIMATE</div>
+      <div class="welcome-big">🤖</div>
+      <div class="welcome-title">EfeMultiAIbot</div>
       <div class="welcome-sub">Sunucuyu başlatıp sohbet et</div>
       <div class="chips">
         <div class="chip" onclick="quickSend('Merhaba! Kendini kısaca tanıt.')">Kendini tanıt</div>
@@ -2483,8 +2483,8 @@ function clearChat(){ history=[]; $('messages').innerHTML=''; $('token-bar').inn
 function hideWelcome(){ $('welcome')?.remove(); }
 function showWelcome(){
   const el=document.createElement('div'); el.className='welcome'; el.id='welcome';
-  el.innerHTML=`<div class="welcome-big">🦙</div>
-    <div class="welcome-title">LLAMA ULTIMATE</div>
+  el.innerHTML=`<div class="welcome-big">🤖</div>
+    <div class="welcome-title">EfeMultiAIbot</div>
     <div class="welcome-sub">Sunucuyu başlatıp sohbet et</div>
     <div class="chips">
       <div class="chip" onclick="quickSend('Merhaba! Kendini kısaca tanıt.')">Kendini tanıt</div>
@@ -3268,7 +3268,7 @@ def webchat_chat_route():
                         )
                         for chunk in r.iter_lines():
                             if chunk:
-                                line = chunk.decode()
+                                line = chunk.decode("utf-8", errors="replace")
                                 if line.startswith("data: "):
                                     raw = line[6:].strip()
                                     if raw == "[DONE]":
@@ -3626,12 +3626,13 @@ def get_thumb_route(img_hash: str):
 #  YARDIMCI FONKSİYONLAR
 # ═══════════════════════════════════════════════════════════════
 
-def ensure_bot_file() -> Path:
-    """whatsapp_bot.js dosyasının var olduğunu doğrula."""
+def ensure_bot_file() -> Optional[Path]:
+    """whatsapp_bot.js dosyasının var olduğunu doğrula. Bulunamazsa None döner."""
     bot_path = APP_DIR / "whatsapp_bot.js"
     if not bot_path.exists():
         log.error(f"whatsapp_bot.js bulunamadı: {bot_path}")
         log.error("Bot başlatılamıyor. Dosyayı proje dizinine kopyalayın.")
+        return None
     return bot_path
 
 
@@ -3726,7 +3727,7 @@ def cleanup(*_):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="LLaMA Ultimate Panel")
+    parser = argparse.ArgumentParser(description="EfeMultiAIbot")
     parser.add_argument('--panel-only',     action='store_true')
     parser.add_argument('--bot-only',       action='store_true')
     parser.add_argument('--setup',          action='store_true')
@@ -3742,9 +3743,10 @@ def main() -> None:
 
     # Signal handler'ları sadece doğrudan çalıştırılınca kaydet.
     # Gunicorn kendi signal yönetimini yapar; çakışma olmasın.
-    signal.signal(signal.SIGINT,  cleanup)
-    signal.signal(signal.SIGTERM, cleanup)
-    atexit.register(cleanup)
+    if not args.gunicorn:
+        signal.signal(signal.SIGINT,  cleanup)
+        signal.signal(signal.SIGTERM, cleanup)
+        atexit.register(cleanup)
 
     if args.setup:
         pkg = APP_DIR / "package.json"
@@ -3774,7 +3776,8 @@ def main() -> None:
         print(json.dumps(report, indent=2, ensure_ascii=False)); return
 
     if args.bot_only:
-        ensure_bot_file()
+        if not ensure_bot_file():
+            sys.exit(1)
         bot.start()
         bot.watch()
         try:
@@ -3784,16 +3787,17 @@ def main() -> None:
         return
 
     # Panel modu
-    ensure_bot_file()
-
     if not args.panel_only:
-        bot.start()
-        bot.watch()
+        if ensure_bot_file():
+            bot.start()
+            bot.watch()
+        else:
+            log.warning("Bot dosyası bulunamadı. Sadece panel modu başlatılıyor.")
 
     if args.gunicorn:
         # Gunicorn ile başlat
         print("╔══════════════════════════════════════════════════════╗")
-        print("║   🦙 LLaMA Ultimate Panel v2.0 (Gunicorn)           ║")
+        print("║   🤖 EfeMultiAIbot (Gunicorn)                        ║")
         print(f"║   → http://localhost:{args.port}                         ║")
         print("╚══════════════════════════════════════════════════════╝")
         os.execvp('gunicorn', [
@@ -3803,7 +3807,7 @@ def main() -> None:
         ])
     else:
         print("╔══════════════════════════════════════════════════════╗")
-        print("║   🦙 LLaMA Ultimate Panel v2.0                      ║")
+        print("║   🤖 EfeMultiAIbot                                   ║")
         print(f"║   → http://localhost:{args.port}                         ║")
         print("║   💡 Production için: python app.py --gunicorn       ║")
         print("╚══════════════════════════════════════════════════════╝")
