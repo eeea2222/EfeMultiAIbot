@@ -1672,6 +1672,15 @@ def _main(path: str, method: str = 'GET', **kwargs) -> http_req.Response:
                            timeout=kwargs.pop('timeout', 10), **kwargs)
 
 
+@app.after_request
+def _add_security_headers(response):
+    """Her yanıta temel güvenlik başlıkları ekle."""
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('X-Frame-Options', 'SAMEORIGIN')
+    response.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
+    return response
+
+
 @app.route('/')
 def index():
     """Chat arayüzünü sun. Cookie yoksa yeni UID ata."""

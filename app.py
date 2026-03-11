@@ -35,6 +35,7 @@ Gereksinimler:
 #  IMPORTS
 # ═══════════════════════════════════════════════════════════════
 import argparse
+import ast as _ast
 import atexit
 import base64 as b64mod
 import glob
@@ -42,6 +43,7 @@ import hashlib
 import io
 import json
 import logging
+import operator as _operator
 import os
 import queue
 import signal
@@ -128,6 +130,88 @@ WHATSAPP_GROUPS       = [
     for g in os.environ.get("WHATSAPP_GROUPS", "MyGroup1,MyGroup2").split(",")
     if g.strip()
 ]
+
+# ═══════════════════════════════════════════════════════════════
+#  GÜVENLİ HESAP MAKİNESİ — AST Tabanlı (eval() kullanılmaz)
+# ═══════════════════════════════════════════════════════════════
+
+def _safe_calc_eval(expr_str: str):
+    """
+    AST tabanlı güvenli matematik değerlendirici.
+    eval() kullanmaz; yalnızca sayılar, aritmetik ve math
+    fonksiyonlarına izin verir.
+    """
+    import math
+
+    _ALLOWED_NODES = (
+        _ast.Expression, _ast.Constant,
+        _ast.BinOp, _ast.UnaryOp, _ast.Call,
+        _ast.Add, _ast.Sub, _ast.Mult, _ast.Div,
+        _ast.Pow, _ast.Mod, _ast.FloorDiv,
+        _ast.USub, _ast.UAdd,
+        _ast.Name, _ast.Load,
+    )
+
+    _OPS = {
+        _ast.Add:      _operator.add,
+        _ast.Sub:      _operator.sub,
+        _ast.Mult:     _operator.mul,
+        _ast.Div:      _operator.truediv,
+        _ast.Pow:      _operator.pow,
+        _ast.Mod:      _operator.mod,
+        _ast.FloorDiv: _operator.floordiv,
+        _ast.USub:     _operator.neg,
+        _ast.UAdd:     _operator.pos,
+    }
+
+    _NAMES: Dict[str, Any] = {
+        k: v for k, v in math.__dict__.items() if not k.startswith("__")
+    }
+    for _fn in (abs, round, min, max, sum, int, float):
+        _NAMES[_fn.__name__] = _fn
+
+    def _eval(node):
+        if not isinstance(node, _ALLOWED_NODES):
+            raise ValueError(f"İzin verilmeyen ifade türü: {type(node).__name__}")
+        if isinstance(node, _ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, _ast.Constant):
+            if not isinstance(node.value, (int, float, complex)):
+                raise ValueError("Sadece sayısal sabitler desteklenir")
+            return node.value
+        if isinstance(node, _ast.BinOp):
+            op = _OPS.get(type(node.op))
+            if op is None:
+                raise ValueError(f"İzin verilmeyen operatör: {type(node.op).__name__}")
+            return op(_eval(node.left), _eval(node.right))
+        if isinstance(node, _ast.UnaryOp):
+            op = _OPS.get(type(node.op))
+            if op is None:
+                raise ValueError(f"İzin verilmeyen tekli operatör: {type(node.op).__name__}")
+            return op(_eval(node.operand))
+        if isinstance(node, _ast.Call):
+            if not isinstance(node.func, _ast.Name):
+                raise ValueError("Yalnızca basit fonksiyon çağrıları izinli")
+            func = _NAMES.get(node.func.id)
+            if func is None:
+                raise ValueError(f"İzin verilmeyen fonksiyon: {node.func.id}")
+            args = [_eval(a) for a in node.args]
+            if node.keywords:
+                raise ValueError("Anahtar kelime argümanları desteklenmiyor")
+            return func(*args)
+        if isinstance(node, _ast.Name):
+            val = _NAMES.get(node.id)
+            if val is None:
+                raise ValueError(f"İzin verilmeyen değişken: {node.id}")
+            return val
+        raise ValueError(f"Desteklenmeyen düğüm: {type(node).__name__}")
+
+    try:
+        tree = _ast.parse(expr_str.strip(), mode='eval')
+    except SyntaxError as exc:
+        raise ValueError(f"Sözdizimi hatası: {exc}") from exc
+    return _eval(tree)
+
 
 # ═══════════════════════════════════════════════════════════════
 #  KATMAN 1 — LRU RAM Cache (thread-safe, TTL, metriklere sahip)
@@ -251,7 +335,11 @@ def _decode(data: bytes) -> str:
         return payload.decode("utf-8")
     except Exception as e:
         log.warning(f"_decode hatası (len={len(data)}): {e}")
-        return data.decode("utf-8", errors="replace")
+        # Flag baytını atla; sadece payload kısmını çöz
+        try:
+            return data[1:].decode("utf-8", errors="replace") if len(data) > 1 else ""
+        except Exception:
+            return ""
 
 
 def _compress_ratio(data: bytes) -> float:
@@ -883,7 +971,9 @@ class MemoryManager:
             from PIL import Image
             import io
             img = Image.open(io.BytesIO(raw))
-            img.thumbnail(size, Image.LANCZOS)
+            # Pillow 10+ uses Image.Resampling.LANCZOS; older versions use Image.LANCZOS
+            _lanczos = getattr(getattr(Image, 'Resampling', None), 'LANCZOS', None) or Image.LANCZOS
+            img.thumbnail(size, _lanczos)
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=60, optimize=True)
             return buf.getvalue()
@@ -1416,9 +1506,7 @@ def _check_api_key():
     if not PANEL_API_KEY:
         return  # auth devre dışı
     if not request.path.startswith('/api/'):
-        return  # HTML paneli korumasız bırak
-    if request.path == '/health':
-        return  # sağlık kontrolü korumasız
+        return  # HTML paneli ve /health korumasız bırak
     key = request.headers.get('X-API-Key')
     if not key:
         key = request.args.get('api_key')
@@ -1426,6 +1514,15 @@ def _check_api_key():
         key = (request.json or {}).get('api_key')
     if key != PANEL_API_KEY:
         return jsonify({"ok": False, "error": "Yetkisiz erişim"}), 401
+
+
+@app.after_request
+def _add_security_headers(response):
+    """Her yanıta temel güvenlik başlıkları ekle."""
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('X-Frame-Options', 'SAMEORIGIN')
+    response.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
+    return response
 
 # llama-server durumu
 _llm_proc   = None
@@ -3088,20 +3185,11 @@ def webchat_chat_route():
                 return {"text": "⚠ Python Sandbox uzmanı deaktif. Ayarlardan aktif edin."}
 
             if name == "calculator":
-                import math
-                allowed = {k: v for k, v in math.__dict__.items() if not k.startswith("__")}
-                allowed["abs"] = abs
-                allowed["round"] = round
-                allowed["min"] = min
-                allowed["max"] = max
-                allowed["sum"] = sum
-                allowed["int"] = int
-                allowed["float"] = float
                 expr_str = t.get("expr", "")
-                for blocked in ("__", "import", "exec", "eval", "open", "os.", "sys.", "getattr", "setattr"):
-                    if blocked in expr_str:
-                        return f"❌ Güvensiz ifade: '{blocked}' kullanılamaz"
-                res = eval(expr_str, {"__builtins__": {}}, allowed)
+                try:
+                    res = _safe_calc_eval(expr_str)
+                except ValueError as ve:
+                    return {"text": f"❌ Hesaplama hatası: {ve}"}
                 return f"✅ Hesap Sonucu: {res}"
             elif name == "sandbox":
                 import werkzeug.utils, subprocess, os, time as _time, base64
@@ -3152,17 +3240,10 @@ def webchat_chat_route():
         except Exception as e:
             return {"text": f"❌ Araç çalıştırma hatası: {e}"}
 
-    # ── Hesap makinesi için safe eval ──────────────────────────
+    # ── Hesap makinesi için güvenli AST değerlendirici ─────────
     def _calc_eval(expr_str: str):
-        """Güvenli matematik eval — sadece math fonksiyonları."""
-        import math
-        allowed = {k: v for k, v in math.__dict__.items() if not k.startswith("__")}
-        for fn in (abs, round, min, max, sum, int, float):
-            allowed[fn.__name__] = fn
-        for blocked in ("__", "import", "exec", "eval", "open", "os.", "sys.", "getattr", "setattr"):
-            if blocked in expr_str:
-                raise ValueError(f"Güvensiz ifade: '{blocked}' kullanılamaz")
-        return eval(expr_str, {"__builtins__": {}}, allowed)
+        """Güvenli matematik değerlendirici — AST tabanlı, eval() yok."""
+        return _safe_calc_eval(expr_str)
 
     # ── Aşama 1: Gizli LLM çağrısı — math JSON extract ──────
     def _phase1_extract_math(user_text: str):

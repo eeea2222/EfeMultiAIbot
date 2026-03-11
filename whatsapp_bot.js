@@ -280,17 +280,13 @@ client.on('message', async msg => {
             { type: 'image_url', image_url: { url: `data:${imgMime};base64,${imgB64}` } }
           ]
         });
-        // Görseli kaydet (dedup)
-        try {
-          await axios.post(`${PANEL}/api/messages/save`,
-            { chat_id: personId, role: 'user', content: `[Görsel] ${prompt}` });
-        } catch { }
+        // Görseli metin olarak kaydet (LLM çağrısından önce, dedup)
+        await saveMsg(personId, 'user', `[Görsel] ${prompt}`);
       } else {
         finalMsgs.push({ role: 'user', content: enhanced });
+        // Kullanıcı mesajını LLM çağrısından ÖNCE kaydet
+        await saveMsg(personId, 'user', enhanced);
       }
-
-      // Kullanıcı mesajını LLM çağrısından ÖNCE kaydet
-      await saveMsg(personId, 'user', enhanced);
 
       // ── LLM İsteği ──
       const res = await axios.post(llamaUrl, {
@@ -301,12 +297,12 @@ client.on('message', async msg => {
 
       // LaTeX temizliği
       reply = reply
-        .replace(/\$\$(.*?)\$\$/gs, '$1').replace(/\$(.*?)\$/g, '$1')
+        .replace(/\$\$([\s\S]*?)\$\$/g, '$1').replace(/\$([^$\s](?:[^$]*[^$\s])?)\$/g, '$1')
         .replace(/\\text\{([^}]+)\}/g, '$1').replace(/\\boxed\{([^}]+)\}/g, '*$1*')
         .replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, '$1/$2')
         .replace(/\\sqrt\{([^}]+)\}/g, '√$1').replace(/\\cdot/g, '·')
         .replace(/\\times/g, '×').replace(/\\div/g, '÷')
-        .replace(/\\implies/g, '=>').replace(/\\[a-zA-Z]+/g, '');
+        .replace(/\\implies/g, '=>').replace(/\\[a-zA-Z]+\{[^}]*\}/g, '').replace(/\\[a-zA-Z]+/g, '');
 
       // Asistan yanıtını kaydet
       await saveMsg(personId, 'assistant', reply);
