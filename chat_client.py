@@ -16,6 +16,7 @@ Gereksinimler:
 import json
 import logging
 import os
+import pathlib
 import time
 import uuid
 
@@ -29,7 +30,7 @@ import requests as http_req
 MAIN_SERVER  = os.environ.get("MAIN_SERVER",  "http://127.0.0.1:5050")
 CHAT_PORT    = int(os.environ.get("CHAT_PORT",  "5051"))
 CHAT_HOST    = os.environ.get("CHAT_HOST",  "0.0.0.0")
-APP_TITLE    = os.environ.get("APP_TITLE",  "AI Chat")
+APP_TITLE    = os.environ.get("APP_TITLE",  "EfeMultiAIbot")
 COOKIE_NAME  = "wcuid"
 COOKIE_TTL   = 60 * 60 * 24 * 365   # 1 yıl
 
@@ -2005,7 +2006,6 @@ if __name__ == '__main__':
         print(f"║   → http://localhost:{args.port:<28}║")
         print(f"║   → Ana Sunucu: {args.server:<37}║")
         print("╚══════════════════════════════════════════════════════╝")
-        import pathlib
         conf_path = pathlib.Path(__file__).parent / 'gunicorn.conf.py'
         os.execvp('gunicorn', [
             'gunicorn', 'chat_client:app',
