@@ -3626,12 +3626,41 @@ def get_thumb_route(img_hash: str):
 #  YARDIMCI FONKSİYONLAR
 # ═══════════════════════════════════════════════════════════════
 
+def ensure_npm_deps() -> None:
+    """node_modules eksikse npm install çalıştır."""
+    node_modules = APP_DIR / "node_modules"
+    pkg_json = APP_DIR / "package.json"
+    if not pkg_json.exists():
+        return
+    if not node_modules.exists():
+        log.info("node_modules bulunamadı, 'npm install' çalıştırılıyor…")
+        try:
+            result = subprocess.run(
+                ['npm', 'install'],
+                cwd=str(APP_DIR),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode == 0:
+                log.info("npm install başarılı.")
+            else:
+                output = (result.stdout.strip() + "\n" + result.stderr.strip()).strip()
+                log.error(f"npm install başarısız (kod {result.returncode}): {output}")
+        except FileNotFoundError:
+            log.error("npm bulunamadı. Node.js kurulu olduğundan emin olun.")
+        except subprocess.TimeoutExpired:
+            log.error("npm install zaman aşımına uğradı.")
+
+
 def ensure_bot_file() -> Path:
-    """whatsapp_bot.js dosyasının var olduğunu doğrula."""
+    """whatsapp_bot.js dosyasının var olduğunu ve npm bağımlılıklarının kurulu olduğunu doğrula."""
     bot_path = APP_DIR / "whatsapp_bot.js"
     if not bot_path.exists():
         log.error(f"whatsapp_bot.js bulunamadı: {bot_path}")
         log.error("Bot başlatılamıyor. Dosyayı proje dizinine kopyalayın.")
+    else:
+        ensure_npm_deps()
     return bot_path
 
 
