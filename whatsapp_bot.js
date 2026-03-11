@@ -26,6 +26,98 @@ const processingChats = new Set();
 let llmQueue = Promise.resolve();
 let lastSearch = 0;
 
+// ── Connection tracking ──────────────────────────────────────
+const botStats = {
+  messagesProcessed: 0,
+  errors: 0,
+  searches: 0,
+  startTime: Date.now(),
+  lastActivity: null,
+  reconnects: 0,
+};
+
+// ── Yardımcı: güvenli react & clearState ─────────────────────
+async function safeReact(msg, emoji) {
+  try { await msg.react(emoji); } catch (e) {
+    console.warn('[BOT] React hatası:', e.message);
+  }
+}
+async function safeClearState(chat) {
+  try { await chat.clearState(); } catch (e) {
+    console.warn('[BOT] ClearState hatası:', e.message);
+  }
+}
+
+// ── Komut yardımı ────────────────────────────────────────────
+const HELP_TEXT = `🤖 *EfeMultiAIbot Komutları*
+
+📝 *Genel*
+• Mesaj yazın → AI yanıt verir
+• Görseller desteklenir (resim gönder + açıklama)
+
+⚡ *Mod Komutları*
+• *agentic geç* → Gelişmiş AI modu
+• *normal geç* → Normal AI modu
+
+📊 *Bilgi*
+• *!help* → Bu yardım mesajı
+• *!status* → Bot durumu
+• *!clear* → Sohbet geçmişini temizle
+• *!ping* → Bağlantı testi
+
+💡 *İpuçları*
+• Gruplarda @mention ile etiketleyin
+• Uzun cevaplar otomatik bölünür
+• AI gerektığinde otomatik internet arar`;
+
+async function handleCommand(msg, chat, lower, personId) {
+  if (lower === '!help' || lower === '!yardım') {
+    await msg.reply(HELP_TEXT);
+    return true;
+  }
+  if (lower === '!status' || lower === '!durum') {
+    const uptimeSec = Math.floor((Date.now() - botStats.startTime) / 1000);
+    const h = Math.floor(uptimeSec / 3600);
+    const m = Math.floor((uptimeSec % 3600) / 60);
+    const s = uptimeSec % 60;
+    let statusText = `📊 *Bot Durumu*\n\n`;
+    statusText += `⏱ Çalışma: ${h}s ${m}d ${s}sn\n`;
+    statusText += `📨 İşlenen: ${botStats.messagesProcessed} mesaj\n`;
+    statusText += `🔍 Aramalar: ${botStats.searches}\n`;
+    statusText += `❌ Hatalar: ${botStats.errors}\n`;
+    statusText += `🔄 Yeniden bağlantı: ${botStats.reconnects}\n`;
+    try {
+      const st = await getLLMStatus();
+      statusText += `\n🧠 LLM: ${st.running ? '✅ Çalışıyor (Port ' + st.port + ')' : '❌ Kapalı'}`;
+    } catch {
+      statusText += `\n🧠 LLM: ⚠️ Kontrol edilemedi`;
+    }
+    await msg.reply(statusText);
+    return true;
+  }
+  if (lower === '!clear' || lower === '!temizle') {
+    try {
+      await axios.delete(`${PANEL}/api/db/chat/${personId}/clear`, { timeout: 5000 });
+      await msg.reply('🗑️ Sohbet geçmişin temizlendi.');
+    } catch (e) {
+      await msg.reply('❌ Temizleme hatası: ' + e.message);
+    }
+    return true;
+  }
+  if (lower === '!ping') {
+    const start = Date.now();
+    try {
+      await axios.get(`${PANEL}/api/server/status`, { timeout: 3000 });
+      const latency = Date.now() - start;
+      await msg.reply(`🏓 Pong! Panel: ${latency}ms`);
+    } catch {
+      await msg.reply('🏓 Pong! (Panel bağlantısı yok)');
+    }
+    return true;
+  }
+  return false;
+}
+
 // ── API Yardımcıları ─────────────────────────────────────────
 async function getHistory(chatId, limit = 10, budget = 4096) {
   try {
@@ -114,6 +206,7 @@ client.on('auth_failure', msg => {
 
 client.on('disconnected', reason => {
   console.warn('[BOT] Bağlantı koptu:', reason);
+  botStats.reconnects++;
   if (!shuttingDown) {
     const delays = [5000, 15000, 30000, 60000, 120000];
     let attempt = 0;
@@ -179,6 +272,14 @@ client.on('message', async msg => {
   }
 
   let prompt = msg.body.replace(/@\d+/g, '').trim();
+
+  // ── Mesaj uzunluk sınırı ──
+  const MAX_MSG_LEN = 10000;
+  if (prompt.length > MAX_MSG_LEN) {
+    await msg.reply(`⚠️ Mesaj çok uzun (${prompt.length}/${MAX_MSG_LEN} karakter). Lütfen kısaltın.`);
+    return;
+  }
+
   let imgB64 = null, imgMime = '';
 
   if (msg.hasMedia) {
@@ -203,7 +304,12 @@ client.on('message', async msg => {
     const sender = contact.pushname || contact.name || 'Kullanıcı';
     const enhanced = `[${sender}]: ${prompt}`;
     const lower = prompt.toLowerCase();
-      // Komutlar
+
+      // ── Bot komutları ──
+      const handled = await handleCommand(msg, chat, lower, personId);
+      if (handled) { botStats.messagesProcessed++; return; }
+
+      // Mod komutları
       if (lower === 'agentic geç') {
         agenticUsers.add(personId);
         await msg.reply('🤖 Agentic mod aktif.'); return;
@@ -213,7 +319,9 @@ client.on('message', async msg => {
         await msg.reply('👤 Normal mod aktif.'); return;
       }
 
-      await msg.reply('⏳ Düşünüyorum…');
+      // Status indication
+      await safeReact(msg, '💭');
+      await chat.sendStateTyping();
 
       const status = await getLLMStatus();
       if (!status.running) {
@@ -241,6 +349,7 @@ client.on('message', async msg => {
         const now = Date.now();
         if (now - lastSearch >= SEARCH_COOLDOWN) {
           lastSearch = now;
+          botStats.searches++;
           await msg.reply('🔍 Araştırıyorum…');
           try {
             const sr = await google.search(prompt, {
@@ -309,20 +418,28 @@ client.on('message', async msg => {
       // Asistan yanıtını kaydet
       await saveMsg(personId, 'assistant', reply);
 
-      // Uzun cevabı böl (WhatsApp limit ~4096)
+      await safeClearState(chat);
+      await safeReact(msg, '✅');
+      botStats.messagesProcessed++;
+      botStats.lastActivity = Date.now();
+
+      // Uzun cevabı kelimeleri bölmeden böl
       const maxLen = 3900;
       const prefix = searchCtx ? '🌐 *(İnternet Destekli)*\n' : '';
       if (reply.length <= maxLen) {
         await msg.reply(prefix + reply);
       } else {
-        const chunks = [];
-        for (let i = 0; i < reply.length; i += maxLen) chunks.push(reply.slice(i, i + maxLen));
-        for (let i = 0; i < chunks.length; i++)
-          await msg.reply((i === 0 ? prefix : '') + `[${i + 1}/${chunks.length}]\n` + chunks[i]);
+        const chunks = reply.match(new RegExp(`[\\s\\S]{1,${maxLen}}(\\s|$)`, 'g')) || [reply];
+        for (let i = 0; i < chunks.length; i++) {
+          await msg.reply((i === 0 ? prefix : '') + `[${i + 1}/${chunks.length}]\n` + chunks[i].trim());
+        }
       }
       console.log(`[BOT] Yanıt verildi (${reply.length} karakter)`);
 
     } catch (e) {
+      await safeClearState(chat);
+      await safeReact(msg, '❌');
+      botStats.errors++;
       console.error('[BOT] Hata:', e.message);
       try { await msg.reply('Hata: ' + e.message.substring(0, 200)); } catch { }
     } finally {
@@ -337,5 +454,13 @@ console.log(`[BOT] Başlatılıyor… (Panel: ${PANEL})`);
 
 // ── Hata yönetimi ────────────────────────────────────────────
 process.on('unhandledRejection', (reason, promise) => {
+  botStats.errors++;
   console.error('[BOT] Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  botStats.errors++;
+  console.error('[BOT] Uncaught Exception:', err.message);
+  if (err.message.includes('ECONNREFUSED') || err.message.includes('ETIMEDOUT')) return;
+  process.exit(1);
 });
