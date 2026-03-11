@@ -2704,7 +2704,7 @@ def chat():
             for chunk in r.iter_lines():
                 if chunk: yield chunk.decode() + "\n\n"
         except Exception as e:
-            yield f"data: {{\"error\":\"{e}\"}}\n\n"
+            yield f"data: {json.dumps({'error': str(e)[:200]})}\n\n"
     return Response(stream_with_context(gen()),
                     content_type='text/event-stream',
                     headers={'Cache-Control':'no-cache'})
@@ -2722,7 +2722,7 @@ def stats_stream():
                 stats["bot"] = bot.status()
                 yield f"data: {json.dumps(stats)}\n\n"
             except Exception as e:
-                yield f"data: {{\"error\":\"{str(e)[:200]}\"}}\n\n"
+                yield f"data: {json.dumps({'error': str(e)[:200]})}\n\n"
             time.sleep(4)
             # Heartbeat — proxy timeout önlemi
             yield ": heartbeat\n\n"
@@ -3290,7 +3290,7 @@ def webchat_chat_route():
                                     except Exception:
                                         pass
                     except Exception as e:
-                        yield f'data: {{"error":"{e}"}}\n\n'
+                        yield f"data: {json.dumps({'error': str(e)[:200]})}\n\n"
 
                     # Düşünme bitti sinyali
                     yield f'event: thinking\ndata: {{"status":"done"}}\n\n'
@@ -3390,7 +3390,7 @@ def webchat_chat_route():
                         # in_tool=True but stream ended without </tool> — incomplete tool call
                         break
                 except Exception as e:
-                    yield f'data: {{"error":"{e}"}}\n\n'
+                    yield f"data: {json.dumps({'error': str(e)[:200]})}\n\n"
                     break
         except GeneratorExit:
             pass

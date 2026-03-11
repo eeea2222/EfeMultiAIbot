@@ -769,7 +769,7 @@ const state = {
 // ─── Helpers ─────────────────────────────────────────────────
 function $(id){ return document.getElementById(id); }
 function escHtml(t){
-  return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 function fmtTime(ts){ return new Date(ts*1000).toLocaleTimeString('tr-TR',{hour:'2-digit',minute:'2-digit'}); }
 function nowSec(){ return Math.floor(Date.now()/1000); }
@@ -1835,7 +1835,7 @@ def send_route():
                 yield f'data: {{"error":"Ana sunucu yanıt süresi aşıldı."}}\n\n'
                 return
             except Exception as e:
-                yield f'data: {{"error":"{str(e)[:200]}"}}\n\n'
+                yield f"data: {json.dumps({'error': str(e)[:200]})}\n\n"
                 return
             if not got_data:
                 yield f'data: {{"error":"Sunucudan yanıt alınamadı. Model çalışıyor mu?"}}\n\n'
