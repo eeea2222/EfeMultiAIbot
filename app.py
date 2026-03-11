@@ -44,6 +44,7 @@ import json
 import logging
 import os
 import queue
+import re
 import signal
 import sqlite3
 import subprocess
@@ -311,6 +312,14 @@ class WriteBuffer:
 def estimate_tokens(text: str) -> int:
     """Yaklaşık token sayısı (chars / 4, Türkçe için muhafazakâr)."""
     return max(1, len(text) // AVG_CHARS_PER_TOKEN)
+
+
+def _strip_tool_blocks(text: str) -> str:
+    """
+    LLM yanıtından <tool>...</tool> bloklarını sil.
+    Temiz metni konuşma geçmişine kaydetmek için kullanılır.
+    """
+    return re.sub(r'<tool>.*?</tool>', '', text, flags=re.DOTALL).strip()
 
 
 def fit_messages_to_budget(
@@ -2907,7 +2916,7 @@ def webchat_stats_route():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@app.route('/api/webchat/users/<uid>', methods=['POST'])
+@app.route('/api/webchat/users/<uid>', methods=['POST', 'PUT'])
 def webchat_update_user_route(uid: str):
     data = request.json or {}
     # Remove non-updatable keys
@@ -2982,6 +2991,11 @@ def webchat_chat_route():
 
     if not uid or not content:
         return jsonify({"ok": False, "error": "uid ve content zorunlu"}), 400
+
+    # LLM çalışıyor mu? Erken kontrol — stream açmadan önce hata döndür
+    if not _llm_status.get("running"):
+        return jsonify({"ok": False,
+                        "error": "LLM sunucusu çalışmıyor. Panelden başlatın."}), 503
 
     # Rate check
     rate = mm.webchat_check_rate(uid)
@@ -3305,7 +3319,11 @@ def webchat_chat_route():
             if content:
                 mm.save_message(chat_id, "user", content)
             if full_reply:
-                mm.save_message(chat_id, "assistant", full_reply)
+                # <tool>...</tool> bloklarını geçmişe kaydetme — sadece temiz metin sakla
+                reply_to_save = _strip_tool_blocks(full_reply)
+                if reply_to_save:
+                    mm.save_message(chat_id, "assistant", reply_to_save)
+                # LLM cevap üretti → rate sayacını artır (araç çağrısı olsa bile)
                 mm.webchat_log_message(uid)
 
     def _normal_stream(msgs, max_tok):
@@ -3372,6 +3390,12 @@ def webchat_chat_route():
                                         yield line + "\n\n"
                                 except Exception:
                                     pass
+
+                    # Araç etiketi açıldı ama kapanmadı — sessiz tekrara izin verme
+                    if in_tool and "</tool>" not in tool_buffer:
+                        yield (f'data: {{"choices":[{{"delta":{{"content":'
+                               f'" \\n[⚠ Araç etiketi kapatılmadı, yeniden deneyin]"}}}}]}}\n\n')
+                        break  # while döngüsünü bitir
 
                     if not in_tool or "</tool>" in tool_buffer:
                         if not in_tool:
@@ -3497,8 +3521,7 @@ def files_upload():
 
     # Boyut kontrolü
     try:
-        import base64
-        raw = base64.b64decode(data_b64)
+        raw = b64mod.b64decode(data_b64)
     except Exception:
         return jsonify({"ok": False, "error": "Geçersiz base64 verisi"}), 400
 
