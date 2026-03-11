@@ -2704,6 +2704,7 @@ def chat():
             for chunk in r.iter_lines():
                 if chunk: yield chunk.decode() + "\n\n"
         except Exception as e:
+            log.error(f"Chat stream error: {e}")
             yield f"data: {json.dumps({'error': str(e)[:200]})}\n\n"
     return Response(stream_with_context(gen()),
                     content_type='text/event-stream',
@@ -3290,6 +3291,7 @@ def webchat_chat_route():
                                     except Exception:
                                         pass
                     except Exception as e:
+                        log.error(f"Webchat stream error (phase2): {e}")
                         yield f"data: {json.dumps({'error': str(e)[:200]})}\n\n"
 
                     # Düşünme bitti sinyali
@@ -3390,6 +3392,7 @@ def webchat_chat_route():
                         # in_tool=True but stream ended without </tool> — incomplete tool call
                         break
                 except Exception as e:
+                    log.error(f"Webchat normal stream error: {e}")
                     yield f"data: {json.dumps({'error': str(e)[:200]})}\n\n"
                     break
         except GeneratorExit:

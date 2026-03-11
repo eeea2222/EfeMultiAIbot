@@ -1835,6 +1835,7 @@ def send_route():
                 yield f'data: {{"error":"Ana sunucu yanıt süresi aşıldı."}}\n\n'
                 return
             except Exception as e:
+                log.error(f"Stream proxy error: {e}")
                 yield f"data: {json.dumps({'error': str(e)[:200]})}\n\n"
                 return
             if not got_data:
