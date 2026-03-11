@@ -44,6 +44,7 @@ import json
 import logging
 import os
 import queue
+import re
 import signal
 import sqlite3
 import subprocess
@@ -664,7 +665,7 @@ class MemoryManager:
                     INSERT INTO metrics_hourly(hour, msgs_in)
                     VALUES(?,?)
                     ON CONFLICT(hour) DO UPDATE SET msgs_in=msgs_in+excluded.msgs_in
-                """, (hour, len([r for r in rows if r[0] in chat_ids])))
+                """, (hour, len(rows)))
 
     def _prune_chat(self, conn: sqlite3.Connection, chat_id: str) -> int:
         """
@@ -714,9 +715,10 @@ class MemoryManager:
             return cached
 
         # Tampondaki henüz kaydedilmemiş mesajları zorla flush et
-        pending = self._wbuf.drain()
-        if pending:
-            self._bulk_insert(pending)
+        if self._wbuf.size() > 0:
+            pending = self._wbuf.drain()
+            if pending:
+                self._bulk_insert(pending)
 
         conn = self._pool.get()
         rows = conn.execute("""
@@ -1423,8 +1425,6 @@ def _check_api_key():
         return  # auth devre dışı
     if not request.path.startswith('/api/'):
         return  # HTML paneli korumasız bırak
-    if request.path == '/health':
-        return  # sağlık kontrolü korumasız
     key = request.headers.get('X-API-Key')
     if not key:
         key = request.args.get('api_key')
@@ -2907,7 +2907,7 @@ def webchat_stats_route():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@app.route('/api/webchat/users/<uid>', methods=['POST'])
+@app.route('/api/webchat/users/<uid>', methods=['POST', 'PUT'])
 def webchat_update_user_route(uid: str):
     data = request.json or {}
     # Remove non-updatable keys
@@ -3138,7 +3138,7 @@ def webchat_chat_route():
                     pass
 
                 try:
-                    stdout, stderr = proc.communicate(timeout=8)
+                    stdout, stderr = proc.communicate(timeout=10)
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     stdout, stderr = proc.communicate()
@@ -3305,7 +3305,11 @@ def webchat_chat_route():
             if content:
                 mm.save_message(chat_id, "user", content)
             if full_reply:
-                mm.save_message(chat_id, "assistant", full_reply)
+                # Strip <tool>...</tool> blocks so saved history is clean for future context.
+                # Uses DOTALL so the pattern spans newlines (e.g. multi-line sandbox code).
+                clean_reply = re.sub(r'<tool>.*?</tool>', '', full_reply, flags=re.DOTALL).strip()
+                if clean_reply:
+                    mm.save_message(chat_id, "assistant", clean_reply)
                 mm.webchat_log_message(uid)
 
     def _normal_stream(msgs, max_tok):
@@ -3376,6 +3380,9 @@ def webchat_chat_route():
                     if not in_tool or "</tool>" in tool_buffer:
                         if not in_tool:
                             break  # Normal exit
+                    else:
+                        # in_tool=True but stream ended without </tool> — incomplete tool call
+                        break
                 except Exception as e:
                     yield f'data: {{"error":"{e}"}}\n\n'
                     break
