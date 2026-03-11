@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Node
+node_modules/
+
+# Environment
+.env
+.venv
+venv/
+
+# Uploads / generated files
+uploads/
+Sandbox/
