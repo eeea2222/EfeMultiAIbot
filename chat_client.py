@@ -25,6 +25,7 @@ from flask import (
     request, stream_with_context
 )
 import requests as http_req
+import werkzeug.utils
 
 # ─── Yapılandırma ────────────────────────────────────────────
 MAIN_SERVER  = os.environ.get("MAIN_SERVER",  "http://127.0.0.1:5050")
@@ -919,7 +920,7 @@ async function loadHistory(){
   try{
     const r = await fetch(`/api/history?uid=${state.uid}&limit=30`);
     const d = await r.json();
-    if(!d.ok || !d.messages.length) return;
+    if(!d.ok || !Array.isArray(d.messages) || !d.messages.length) return;
     hideWelcome();
     d.messages.forEach(m => appendBubble(m.role, m.content, null, false));
     scrollToBottom();
@@ -1148,7 +1149,7 @@ async function loadFiles(){
   try{
     const r = await fetch(`/api/files/list?uid=${state.uid}`);
     const d = await r.json();
-    if(!d.ok || !d.files.length){
+    if(!d.ok || !Array.isArray(d.files) || !d.files.length){
       grid.innerHTML = '<div style="padding:30px;text-align:center;color:var(--muted);font-size:13px;grid-column:1/-1">Henüz dosya yok</div>';
       return;
     }
@@ -1165,7 +1166,7 @@ async function loadFiles(){
           <div class="file-card-name" title="${escHtml(f.name)}">${escHtml(f.name)}</div>
           <div class="file-card-size">${fmtSize(f.size)}</div>
         </div>
-        <button class="file-card-del" title="Sil" onclick="event.stopPropagation();deleteFile('${escHtml(f.name)}')">✕</button>
+        <button class="file-card-del" title="Sil" onclick="event.stopPropagation();deleteFile(${JSON.stringify(f.name)})">✕</button>
       `;
       card.onclick = () => {
         if(f.is_image) window.open(f.url, '_blank');
@@ -1596,7 +1597,7 @@ async function loadSandbox(){
   try{
     const r = await fetch(`/api/sandbox/list?uid=${state.uid}`);
     const d = await r.json();
-    if(d.ok){
+    if(d.ok && Array.isArray(d.files)){
       if(d.files.length === 0){
          list.innerHTML = '<div style="padding:15px;text-align:center;color:var(--muted);font-size:13px">Henüz dosya yok.</div>';
          return;
@@ -1606,10 +1607,10 @@ async function loadSandbox(){
          const row = document.createElement('div');
          row.className = 'sb-file';
          row.innerHTML = `
-           <span class="sb-file-name">${escHtml(f.name)} <span style="color:var(--faint)">(${f.size})</span></span>
+           <span class="sb-file-name">${escHtml(f.name)} <span style="color:var(--faint)">(${fmtSize(f.size)})</span></span>
            <div class="sb-actions">
-             <button class="sb-btn" onclick="window.open('/api/sandbox/download/${state.uid}/${encodeURIComponent(f.name)}')">İndir</button>
-             <button class="sb-btn del" onclick="deleteSandboxFile('${escHtml(f.name)}')">Sil</button>
+             <button class="sb-btn" onclick="window.open('/api/sandbox/download/'+encodeURIComponent(${JSON.stringify(state.uid)})+'/'+encodeURIComponent(${JSON.stringify(f.name)}))">İndir</button>
+             <button class="sb-btn del" onclick="deleteSandboxFile(${JSON.stringify(f.name)})">Sil</button>
            </div>
          `;
          list.appendChild(row);
@@ -1888,8 +1889,13 @@ def sandbox_delete():
     uid = data.get('uid') or _get_uid()
     filename = data.get('filename')
     if not uid or not filename: return jsonify({"ok": False}), 400
+    # Sanitize to prevent path traversal via proxy URL
+    safe_uid = werkzeug.utils.secure_filename(uid)
+    safe_name = werkzeug.utils.secure_filename(filename)
+    if not safe_uid or not safe_name:
+        return jsonify({"ok": False, "error": "Geçersiz dosya adı"}), 400
     try:
-        r = _main(f"/api/webchat/sandbox/{uid}/{filename}", method="DELETE")
+        r = _main(f"/api/webchat/sandbox/{safe_uid}/{safe_name}", method="DELETE")
         return Response(r.content, status=r.status_code, headers=dict(r.headers))
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
@@ -1908,8 +1914,13 @@ def sandbox_save():
 
 @app.route('/api/sandbox/download/<uid>/<filename>')
 def sandbox_download(uid, filename):
+    # Sanitize to prevent path traversal via proxy URL
+    safe_uid = werkzeug.utils.secure_filename(uid)
+    safe_name = werkzeug.utils.secure_filename(filename)
+    if not safe_uid or not safe_name:
+        return jsonify({"ok": False, "error": "Geçersiz dosya adı"}), 400
     try:
-        r = _main(f"/api/webchat/sandbox/download/{uid}/{filename}", stream=True)
+        r = _main(f"/api/webchat/sandbox/download/{safe_uid}/{safe_name}", stream=True)
         headers = {'Content-Type': r.headers.get('Content-Type', 'application/octet-stream')}
         if 'Content-Disposition' in r.headers:
             headers['Content-Disposition'] = r.headers['Content-Disposition']
@@ -1946,8 +1957,13 @@ def files_list_proxy():
 
 @app.route('/api/files/serve/<uid>/<filename>')
 def files_serve_proxy(uid, filename):
+    # Sanitize to prevent path traversal via proxy URL
+    safe_uid = werkzeug.utils.secure_filename(uid)
+    safe_name = werkzeug.utils.secure_filename(filename)
+    if not safe_uid or not safe_name:
+        return jsonify({"ok": False, "error": "Geçersiz dosya adı"}), 400
     try:
-        r = _main(f"/api/webchat/files/{uid}/{filename}", stream=True)
+        r = _main(f"/api/webchat/files/{safe_uid}/{safe_name}", stream=True)
         headers = {'Content-Type': r.headers.get('Content-Type', 'application/octet-stream')}
         if 'Content-Disposition' in r.headers:
             headers['Content-Disposition'] = r.headers['Content-Disposition']
@@ -1962,8 +1978,13 @@ def files_delete_proxy():
     uid = data.get('uid') or _get_uid()
     filename = data.get('filename')
     if not uid or not filename: return jsonify({"ok": False}), 400
+    # Sanitize to prevent path traversal via proxy URL
+    safe_uid = werkzeug.utils.secure_filename(uid)
+    safe_name = werkzeug.utils.secure_filename(filename)
+    if not safe_uid or not safe_name:
+        return jsonify({"ok": False, "error": "Geçersiz dosya adı"}), 400
     try:
-        r = _main(f"/api/webchat/files/{uid}/{filename}", method="DELETE")
+        r = _main(f"/api/webchat/files/{safe_uid}/{safe_name}", method="DELETE")
         return Response(r.content, status=r.status_code,
                         content_type='application/json')
     except Exception as e:
