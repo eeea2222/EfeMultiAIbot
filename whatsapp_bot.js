@@ -198,12 +198,11 @@ client.on('message', async msg => {
   processingChats.add(chat.id._serialized);
 
   llmQueue = llmQueue.then(async () => {
+    try {
     const contact = await msg.getContact();
     const sender = contact.pushname || contact.name || 'Kullanıcı';
     const enhanced = `[${sender}]: ${prompt}`;
     const lower = prompt.toLowerCase();
-
-    try {
       // Komutlar
       if (lower === 'agentic geç') {
         agenticUsers.add(personId);
@@ -280,17 +279,16 @@ client.on('message', async msg => {
             { type: 'image_url', image_url: { url: `data:${imgMime};base64,${imgB64}` } }
           ]
         });
-        // Görseli kaydet (dedup)
+        // Görseli kaydet (dedup) — yalnızca bir kez kaydedilir
         try {
           await axios.post(`${PANEL}/api/messages/save`,
             { chat_id: personId, role: 'user', content: `[Görsel] ${prompt}` });
         } catch { }
       } else {
         finalMsgs.push({ role: 'user', content: enhanced });
+        // Kullanıcı mesajını LLM çağrısından ÖNCE kaydet
+        await saveMsg(personId, 'user', enhanced);
       }
-
-      // Kullanıcı mesajını LLM çağrısından ÖNCE kaydet
-      await saveMsg(personId, 'user', enhanced);
 
       // ── LLM İsteği ──
       const res = await axios.post(llamaUrl, {
