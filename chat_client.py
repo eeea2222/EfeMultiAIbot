@@ -638,6 +638,12 @@ body{height:100%;background:var(--ink);color:var(--paper);
     <div class="user-chip" id="newchat-chip" onclick="startNewChat()" title="Yeni Sohbet Başlat">
       🗑️<span class="chip-label"> Yeni</span>
     </div>
+    <div class="user-chip" id="search-chip" onclick="openSearchModal()" title="Mesajlarda Ara">
+      🔍<span class="chip-label"> Ara</span>
+    </div>
+    <div class="user-chip" id="export-chip" onclick="exportChat()" title="Sohbeti Dışa Aktar">
+      📥<span class="chip-label"> Aktar</span>
+    </div>
     <div class="user-chip" id="settings-chip" onclick="openSettingsModal()" title="AI Uzmanları / Ayarlar">
       ⚙️<span class="chip-label"> Uzmanlar</span>
     </div>
@@ -753,6 +759,19 @@ body{height:100%;background:var(--ink);color:var(--paper);
       <div style="padding:20px;text-align:center;color:var(--muted);font-size:13px;grid-column:1/-1">Yükleniyor...</div>
     </div>
     <button class="modal-btn" onclick="closeFilesModal()">Kapat</button>
+  </div>
+</div>
+
+<!-- SEARCH MODAL -->
+<div class="modal-backdrop" id="search-modal" style="display:none" onclick="if(event.target===this)closeSearchModal()">
+  <div class="modal" style="width:520px">
+    <div class="modal-title">🔍 Mesajlarda Ara</div>
+    <div class="modal-sub">Sohbet geçmişinde arama yap.</div>
+    <input type="text" id="search-input" placeholder="Arama terimi..." maxlength="200"
+      onkeydown="if(event.key==='Enter')performSearch()" style="margin-bottom:8px">
+    <button class="modal-btn" onclick="performSearch()" style="margin-bottom:14px">Ara</button>
+    <div id="search-results" style="max-height:350px;overflow-y:auto"></div>
+    <button class="modal-btn" onclick="closeSearchModal()" style="margin-top:10px">Kapat</button>
   </div>
 </div>
 
@@ -958,17 +977,18 @@ function appendBubble(role, text, ts, animate=true){
 
 function renderBubbleContent(el, text){
   if (typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined') {
-    if (!marked.defaults.highlight) {
-      marked.setOptions({
-        breaks: true,
-        highlight: function(code, lang) {
-          if (lang && hljs.getLanguage(lang)) {
-            return hljs.highlight(code, { language: lang }).value;
-          }
-          return hljs.highlightAuto(code).value;
-        }
-      });
-    }
+    // Use marked renderer for code highlighting (v5+ compatible)
+    const renderer = new marked.Renderer();
+    renderer.code = function(code, lang){
+      let highlighted;
+      if(lang && hljs.getLanguage(lang)){
+        highlighted = hljs.highlight(code, {language:lang}).value;
+      } else {
+        highlighted = hljs.highlightAuto(code).value;
+      }
+      return `<pre><code class="hljs language-${lang||'auto'}">${highlighted}</code></pre>`;
+    };
+    marked.setOptions({ breaks: true, renderer });
     el.innerHTML = DOMPurify.sanitize(marked.parse(text));
     
     // Add "Save to Sandbox" button for python code blocks
@@ -1652,6 +1672,87 @@ async function saveToSandbox(code){
   }
 }
 
+// ─── Search logic ──────────────────────────────────────────────
+function openSearchModal(){
+  $('search-modal').style.display='flex';
+  $('search-results').innerHTML='';
+  setTimeout(()=>$('search-input').focus(), 50);
+}
+function closeSearchModal(){ $('search-modal').style.display='none'; }
+
+async function performSearch(){
+  const query = $('search-input').value.trim();
+  if(!query || query.length < 2){ alert('En az 2 karakter girin.'); return; }
+  const results = $('search-results');
+  results.innerHTML = '<div style="padding:12px;text-align:center;color:var(--muted);font-size:13px">Aranıyor...</div>';
+  try{
+    const r = await fetch(`/api/search?q=${encodeURIComponent(query)}&uid=${state.uid}`);
+    const d = await r.json();
+    if(!d.ok || !d.results?.length){
+      results.innerHTML = '<div style="padding:12px;text-align:center;color:var(--muted);font-size:13px">Sonuç bulunamadı.</div>';
+      return;
+    }
+    results.innerHTML = '';
+    d.results.forEach(r => {
+      const item = document.createElement('div');
+      item.style.cssText = 'padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);font-size:13px;cursor:pointer;transition:background .2s';
+      item.onmouseover = ()=>item.style.background='rgba(255,255,255,.04)';
+      item.onmouseout  = ()=>item.style.background='';
+      const roleIcon = r.role === 'user' ? '👤' : '🤖';
+      const time = r.ts ? new Date(r.ts*1000).toLocaleString('tr-TR') : '';
+      item.innerHTML = `
+        <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+          <span style="color:var(--amber);font-size:11px">${roleIcon} ${escHtml(r.role)}</span>
+          <span style="color:var(--muted);font-size:10px;font-family:var(--mono)">${time}</span>
+        </div>
+        <div style="color:var(--paper);line-height:1.5">${escHtml(r.snippet)}</div>
+      `;
+      results.appendChild(item);
+    });
+  }catch(e){
+    results.innerHTML = `<div style="padding:12px;text-align:center;color:#e07070;font-size:13px">Hata: ${escHtml(e.message)}</div>`;
+  }
+}
+
+// ─── Export chat ──────────────────────────────────────────────
+async function exportChat(){
+  if(!state.uid){ alert('Oturum bulunamadı.'); return; }
+  try{
+    const r = await fetch(`/api/export/web:${state.uid}`);
+    if(!r.ok){ alert('Dışa aktarma başarısız.'); return; }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `chat_export_${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }catch(e){
+    alert('Hata: ' + e.message);
+  }
+}
+
+// ─── Keyboard shortcuts ──────────────────────────────────────
+document.addEventListener('keydown', e => {
+  // Ctrl+K → Search
+  if((e.ctrlKey || e.metaKey) && e.key === 'k'){
+    e.preventDefault();
+    openSearchModal();
+  }
+  // Ctrl+E → Export
+  if((e.ctrlKey || e.metaKey) && e.key === 'e'){
+    e.preventDefault();
+    exportChat();
+  }
+  // Escape → close any modal
+  if(e.key === 'Escape'){
+    closeSearchModal();
+    closeSettingsModal();
+    closeSandboxModal();
+    closeFilesModal();
+  }
+});
+
 // ─── Boot ─────────────────────────────────────────────────────
 $('app-title').textContent = '{{ title }}';
 initSession();
@@ -1760,6 +1861,36 @@ def history_route():
         return jsonify(r.json())
     except Exception as e:
         return jsonify({"ok": False, "messages": [], "error": str(e)})
+
+
+@app.route('/api/search')
+def search_proxy():
+    """Mesaj aramayı ana sunucuya ilet."""
+    uid = request.args.get('uid') or request.cookies.get(COOKIE_NAME, '')
+    query = request.args.get('q', '')
+    limit = request.args.get('limit', '50')
+    try:
+        chat_id = f"web:{uid}" if uid else ''
+        r = _main('/api/search', method='GET',
+                  params={'q': query, 'chat_id': chat_id, 'limit': limit})
+        return Response(r.content, status=r.status_code,
+                        content_type='application/json')
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+
+@app.route('/api/export/<path:chat_id>')
+def export_proxy(chat_id):
+    """Sohbet dışa aktarmayı ana sunucuya ilet."""
+    try:
+        r = _main(f'/api/export/{chat_id}', method='GET',
+                  params=dict(request.args))
+        headers = {'Content-Type': r.headers.get('Content-Type', 'application/json')}
+        if 'Content-Disposition' in r.headers:
+            headers['Content-Disposition'] = r.headers['Content-Disposition']
+        return Response(r.content, status=r.status_code, headers=headers)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
 
 
 @app.route('/api/history/clear', methods=['POST'])
