@@ -1606,7 +1606,7 @@ async function loadSandbox(){
          const row = document.createElement('div');
          row.className = 'sb-file';
          row.innerHTML = `
-           <span class="sb-file-name">${escHtml(f.name)} <span style="color:var(--faint)">(${f.size})</span></span>
+           <span class="sb-file-name">${escHtml(f.name)} <span style="color:var(--faint)">(${fmtSize(f.size)})</span></span>
            <div class="sb-actions">
              <button class="sb-btn" onclick="window.open('/api/sandbox/download/${state.uid}/${encodeURIComponent(f.name)}')">İndir</button>
              <button class="sb-btn del" onclick="deleteSandboxFile('${escHtml(f.name)}')">Sil</button>
