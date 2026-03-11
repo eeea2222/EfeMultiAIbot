@@ -6,6 +6,7 @@
 ║                                                                      ║
 ║  Yenilikler:                                                         ║
 ║  • 3 katmanlı bellek: L1 LRU-RAM → L2 sıkıştırılmış SQLite → L3 arşiv
+║  • RAG: ChromaDB vektör bellek — geçmiş konuşmaları semantik arama  ║
 ║  • Adaptif sıkıştırma: zlib lvl1/6/9 + delta encoding               ║
 ║  • LLM özetleme: eski bağlamı sil değil, özetle → token tasarrufu   ║
 ║  • Bağlantı havuzu: thread-local SQLite + WAL + mmap                ║
@@ -52,7 +53,7 @@ import sys
 import textwrap
 import threading
 import time
-import traceback
+import uuid as uuid_mod
 import zlib
 from collections import OrderedDict, defaultdict, deque
 from contextlib import contextmanager
@@ -60,9 +61,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
-from flask import Flask, Response, jsonify, request, send_file, stream_with_context
+from flask import Flask, Response, jsonify, request, send_file, send_from_directory, stream_with_context
 import requests as http_req
 import werkzeug.utils
+
+# Maksimum mesaj uzunluğu (DoS koruması)
+MAX_MESSAGE_LENGTH = 50_000  # karakter
+MAX_CHAT_ID_LENGTH = 256
 
 # ═══════════════════════════════════════════════════════════════
 #  LOGGING
@@ -129,6 +134,16 @@ WHATSAPP_GROUPS       = [
     for g in os.environ.get("WHATSAPP_GROUPS", "MyGroup1,MyGroup2").split(",")
     if g.strip()
 ]
+
+# ─── RAG (Retrieval-Augmented Generation) ────────────────────
+RAG_DIR               = str(APP_DIR / "rag_store")    # ChromaDB kalıcı dizini
+RAG_COLLECTION        = "messages"
+RAG_TOP_K             = 5          # sorgu başına döndürülecek en benzer parça
+RAG_MIN_SCORE         = 0.25       # 1-distance; bunun altı atlanır
+RAG_CHUNK_SIZE        = 480        # karakter — uzun mesajları bu boyutta parçala
+RAG_CHUNK_OVERLAP     = 80         # parçalar arası örtüşme
+RAG_INDEX_BATCH       = 256        # toplu indeksleme boyutu
+RAG_ENABLED           = os.environ.get("RAG_ENABLED", "1") == "1"
 
 # ═══════════════════════════════════════════════════════════════
 #  KATMAN 1 — LRU RAM Cache (thread-safe, TTL, metriklere sahip)
@@ -342,6 +357,421 @@ def fit_messages_to_budget(
 
 
 # ═══════════════════════════════════════════════════════════════
+#  RAG — Retrieval-Augmented Generation (Vektör Bellek)
+# ═══════════════════════════════════════════════════════════════
+
+class LLMEmbeddingFunction:
+    """
+    Yerel LLM sunucusunun /v1/embeddings endpointini embedding kaynağı olarak kullanır.
+    ChromaDB EmbeddingFunction protokolüne uyumludur.
+    """
+
+    def __init__(self, base_url: str = "http://127.0.0.1:8080",
+                 model: str = "local"):
+        self._url = f"{base_url}/v1/embeddings"
+        self._model = model
+        self._dim: Optional[int] = None
+
+    def __call__(self, input: List[str]) -> List[List[float]]:
+        if not input:
+            return []
+        resp = http_req.post(
+            self._url,
+            json={"model": self._model, "input": input},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()["data"]
+        embeddings = [item["embedding"] for item in sorted(data, key=lambda x: x["index"])]
+        if embeddings and self._dim is None:
+            self._dim = len(embeddings[0])
+        return embeddings
+
+    @property
+    def dimension(self) -> Optional[int]:
+        return self._dim
+
+
+class VectorStore:
+    """
+    ChromaDB tabanlı vektör bellek — RAG sistemi.
+
+    Mesajları chunk'lara bölerek indeksler ve semantik arama ile
+    geçmiş bağlamı çeker. L3 arşivideki yıl önceki konuşmalar bile
+    sorgulanabilir.
+
+    Embedding kaynakları (öncelik sırasıyla):
+        1. Yerel LLM /v1/embeddings endpoint
+        2. ChromaDB default (all-MiniLM-L6-v2 ONNX)
+        3. RAG devre dışı kalır
+    """
+
+    def __init__(self, persist_dir: str = RAG_DIR,
+                 collection_name: str = RAG_COLLECTION,
+                 llm_port: int = 8080):
+        self._persist_dir = persist_dir
+        self._collection_name = collection_name
+        self._llm_port = llm_port
+
+        self._client = None
+        self._collection = None
+        self._embed_fn = None
+        self._available = False
+        self._stats = {"indexed": 0, "queries": 0, "errors": 0}
+        self._lock = threading.Lock()
+
+        self._init()
+
+    # ── Başlatma ──────────────────────────────────────────────
+
+    def _init(self) -> None:
+        """ChromaDB istemcisini ve embedding fonksiyonunu başlat."""
+        try:
+            import chromadb
+            from chromadb.config import Settings as ChromaSettings
+        except ImportError:
+            log.warning("RAG: chromadb yüklü değil → pip install chromadb")
+            return
+
+        os.makedirs(self._persist_dir, exist_ok=True)
+
+        # Embedding fonksiyonu seç
+        self._embed_fn = self._pick_embedding_fn()
+        if self._embed_fn is None:
+            log.warning("RAG: Hiçbir embedding kaynağı bulunamadı, RAG devre dışı")
+            return
+
+        try:
+            self._client = chromadb.PersistentClient(
+                path=self._persist_dir,
+                settings=ChromaSettings(anonymized_telemetry=False),
+            )
+            self._collection = self._client.get_or_create_collection(
+                name=self._collection_name,
+                embedding_function=self._embed_fn,
+                metadata={"hnsw:space": "cosine"},
+            )
+            count = self._collection.count()
+            self._stats["indexed"] = count
+            self._available = True
+            log.info(f"RAG: ChromaDB hazır — {count} vektör ({self._persist_dir})")
+        except Exception as e:
+            log.error(f"RAG: ChromaDB başlatma hatası: {e}")
+            self._available = False
+
+    def _pick_embedding_fn(self):
+        """En uygun embedding fonksiyonunu seç."""
+        # 1. Yerel LLM endpoint
+        try:
+            fn = LLMEmbeddingFunction(
+                base_url=f"http://127.0.0.1:{self._llm_port}",
+            )
+            test = fn(["test"])
+            if test and len(test[0]) > 0:
+                log.info(f"RAG: LLM embedding aktif (dim={len(test[0])})")
+                return fn
+        except Exception as e:
+            log.debug(f"RAG: LLM embedding kullanılamıyor: {e}")
+
+        # 2. ChromaDB default embedding (ONNX all-MiniLM-L6-v2)
+        try:
+            from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+            fn = DefaultEmbeddingFunction()
+            test = fn(["test"])
+            if test and len(test[0]) > 0:
+                log.info(f"RAG: Default embedding aktif (dim={len(test[0])})")
+                return fn
+        except Exception as e:
+            log.debug(f"RAG: Default embedding kullanılamıyor: {e}")
+
+        return None
+
+    # ── Durum ─────────────────────────────────────────────────
+
+    @property
+    def available(self) -> bool:
+        return self._available and self._collection is not None
+
+    def get_stats(self) -> Dict[str, Any]:
+        """RAG istatistikleri."""
+        stats = dict(self._stats)
+        stats["available"] = self.available
+        stats["persist_dir"] = self._persist_dir
+        if self.available:
+            try:
+                stats["indexed"] = self._collection.count()
+            except Exception:
+                pass
+            # Disk boyutu
+            total = 0
+            for root, dirs, files in os.walk(self._persist_dir):
+                for f in files:
+                    total += os.path.getsize(os.path.join(root, f))
+            stats["disk_mb"] = round(total / 1024**2, 2)
+        else:
+            stats["disk_mb"] = 0
+        stats["embed_type"] = (
+            "llm" if isinstance(self._embed_fn, LLMEmbeddingFunction)
+            else "default" if self._embed_fn else "none"
+        )
+        return stats
+
+    # ── Metin parçalama ───────────────────────────────────────
+
+    @staticmethod
+    def _chunk_text(text: str, size: int = RAG_CHUNK_SIZE,
+                    overlap: int = RAG_CHUNK_OVERLAP) -> List[str]:
+        """Uzun metni kelime sınırlarından parçalara böl."""
+        if len(text) <= size:
+            return [text]
+
+        chunks: List[str] = []
+        start = 0
+        while start < len(text):
+            end = start + size
+            if end < len(text):
+                # Kelime sınırında kes
+                space_idx = text.rfind(' ', start, end)
+                if space_idx > start:
+                    end = space_idx
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            start = end - overlap if overlap and end < len(text) else end
+        return chunks
+
+    # ── İndeksleme ────────────────────────────────────────────
+
+    def index_message(self, chat_id: str, role: str, content: str,
+                      ts: int = 0, msg_id: Optional[int] = None) -> int:
+        """
+        Tek bir mesajı vektör deposuna indeksle.
+        Mesaj uzunsa parçalara bölünür.
+        Dönüş: eklenen chunk sayısı.
+        """
+        if not self.available or not content or len(content.strip()) < 20:
+            return 0
+
+        chunks = self._chunk_text(content)
+        ids, docs, metas = [], [], []
+
+        for i, chunk in enumerate(chunks):
+            doc_id = f"{chat_id}:{msg_id or ts}:{i}"
+            ids.append(doc_id)
+            docs.append(chunk)
+            metas.append({
+                "chat_id": chat_id,
+                "role": role,
+                "ts": ts or int(time.time()),
+                "chunk_idx": i,
+                "total_chunks": len(chunks),
+                "msg_id": msg_id or 0,
+            })
+
+        try:
+            with self._lock:
+                self._collection.upsert(
+                    ids=ids,
+                    documents=docs,
+                    metadatas=metas,
+                )
+            self._stats["indexed"] = self._collection.count()
+            return len(chunks)
+        except Exception as e:
+            self._stats["errors"] += 1
+            log.warning(f"RAG index hatası: {e}")
+            return 0
+
+    def index_messages_batch(self, messages: List[Dict[str, Any]]) -> int:
+        """
+        Toplu mesaj indeksleme.
+        Her dict: {chat_id, role, content, ts, msg_id}
+        """
+        if not self.available:
+            return 0
+
+        all_ids, all_docs, all_metas = [], [], []
+
+        for msg in messages:
+            content = msg.get("content", "")
+            if not content or len(content.strip()) < 20:
+                continue
+            chat_id = msg["chat_id"]
+            role = msg.get("role", "user")
+            ts = msg.get("ts", int(time.time()))
+            msg_id = msg.get("msg_id", 0)
+
+            chunks = self._chunk_text(content)
+            for i, chunk in enumerate(chunks):
+                doc_id = f"{chat_id}:{msg_id or ts}:{i}"
+                all_ids.append(doc_id)
+                all_docs.append(chunk)
+                all_metas.append({
+                    "chat_id": chat_id,
+                    "role": role,
+                    "ts": ts,
+                    "chunk_idx": i,
+                    "total_chunks": len(chunks),
+                    "msg_id": msg_id,
+                })
+
+        if not all_ids:
+            return 0
+
+        total = 0
+        try:
+            with self._lock:
+                # Batch'ler halinde yükle (ChromaDB limitleri için)
+                for start in range(0, len(all_ids), RAG_INDEX_BATCH):
+                    end = start + RAG_INDEX_BATCH
+                    self._collection.upsert(
+                        ids=all_ids[start:end],
+                        documents=all_docs[start:end],
+                        metadatas=all_metas[start:end],
+                    )
+                    total += end - start
+            self._stats["indexed"] = self._collection.count()
+        except Exception as e:
+            self._stats["errors"] += 1
+            log.error(f"RAG batch index hatası: {e}")
+        return min(total, len(all_ids))
+
+    # ── Arama / Retrieval ─────────────────────────────────────
+
+    def search(self, query: str, chat_id: Optional[str] = None,
+               k: int = RAG_TOP_K, min_score: float = RAG_MIN_SCORE,
+               ) -> List[Dict[str, Any]]:
+        """
+        Semantik arama. En benzer k belge parçasını döndürür.
+
+        Dönüş: [{"content", "chat_id", "role", "ts", "score"}, …]
+        """
+        if not self.available or not query.strip():
+            return []
+
+        self._stats["queries"] += 1
+
+        where_filter = {"chat_id": chat_id} if chat_id else None
+        try:
+            results = self._collection.query(
+                query_texts=[query],
+                n_results=k,
+                where=where_filter,
+                include=["documents", "metadatas", "distances"],
+            )
+        except Exception as e:
+            self._stats["errors"] += 1
+            log.warning(f"RAG arama hatası: {e}")
+            return []
+
+        docs = results.get("documents", [[]])[0]
+        metas = results.get("metadatas", [[]])[0]
+        dists = results.get("distances", [[]])[0]
+
+        items: List[Dict[str, Any]] = []
+        for doc, meta, dist in zip(docs, metas, dists):
+            score = 1.0 - dist   # cosine distance → similarity
+            if score < min_score:
+                continue
+            items.append({
+                "content": doc,
+                "chat_id": meta.get("chat_id", ""),
+                "role": meta.get("role", ""),
+                "ts": meta.get("ts", 0),
+                "score": round(score, 4),
+                "msg_id": meta.get("msg_id", 0),
+            })
+        return items
+
+    def build_rag_context(self, query: str, chat_id: Optional[str] = None,
+                          token_budget: int = 1024) -> str:
+        """
+        Semantik arama sonuçlarını LLM'e enjekte edilecek
+        tek bir bağlam stringine dönüştür.
+        """
+        results = self.search(query, chat_id=chat_id, k=RAG_TOP_K * 2)
+        if not results:
+            return ""
+
+        lines: List[str] = []
+        used_tokens = 0
+        seen: set = set()
+
+        for r in results:
+            snippet = r["content"].strip()
+            # Dedup
+            sig = snippet[:100]
+            if sig in seen:
+                continue
+            seen.add(sig)
+
+            tok = estimate_tokens(snippet)
+            if used_tokens + tok > token_budget:
+                break
+
+            ts_str = datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d %H:%M") if r["ts"] else "?"
+            role_label = {"user": "Kullanıcı", "assistant": "AI", "system": "Özet"}.get(r["role"], r["role"])
+            lines.append(f"[{ts_str} | {role_label} | Skor: {r['score']}]\n{snippet}")
+            used_tokens += tok
+
+        if not lines:
+            return ""
+
+        return (
+            "══ İLGİLİ GEÇMİŞ BAĞLAM (RAG) ══\n"
+            "Aşağıdaki geçmiş konuşma parçaları, kullanıcının mevcut sorusuyla "
+            "anlamsal olarak benzer bulundu. Yanıtında bu bilgileri doğal şekilde "
+            "kullan, ancak 'geçmiş bağlamda gördüm' gibi ifadeler kullanma.\n\n"
+            + "\n---\n".join(lines)
+        )
+
+    # ── Silme / Sıfırlama ────────────────────────────────────
+
+    def delete_chat(self, chat_id: str) -> int:
+        """Belirli bir sohbetin tüm vektörlerini sil."""
+        if not self.available:
+            return 0
+        try:
+            with self._lock:
+                self._collection.delete(where={"chat_id": chat_id})
+            n = self._stats["indexed"] - self._collection.count()
+            self._stats["indexed"] = self._collection.count()
+            return max(0, n)
+        except Exception as e:
+            log.warning(f"RAG silme hatası: {e}")
+            return 0
+
+    def reset(self) -> bool:
+        """Tüm vektör verisini sıfırla."""
+        if not self._client:
+            return False
+        try:
+            with self._lock:
+                self._client.delete_collection(self._collection_name)
+                self._collection = self._client.get_or_create_collection(
+                    name=self._collection_name,
+                    embedding_function=self._embed_fn,
+                    metadata={"hnsw:space": "cosine"},
+                )
+            self._stats["indexed"] = 0
+            log.info("RAG: Vektör deposu sıfırlandı")
+            return True
+        except Exception as e:
+            log.error(f"RAG reset hatası: {e}")
+            return False
+
+    def try_reinit(self, llm_port: int = 8080) -> bool:
+        """
+        Embedding kaynağı değiştiğinde (ör. LLM başlatıldığında)
+        bağlantıyı yeniden dene.
+        """
+        self._llm_port = llm_port
+        self._available = False
+        self._init()
+        return self.available
+
+
+# ═══════════════════════════════════════════════════════════════
 #  KATMAN 2+3 — SQLite Bağlantı Havuzu
 # ═══════════════════════════════════════════════════════════════
 
@@ -408,11 +838,12 @@ class ConnectionPool:
 
 class MemoryManager:
     """
-    3 katmanlı akıllı bellek sistemi:
+    3+RAG katmanlı akıllı bellek sistemi:
 
     L1  LRU RAM cache        — en hızlı, sınırlı kapasiteli
     L2  SQLite compressed    — aktif mesajlar, zlib-6
     L3  SQLite archive       — 30+ günlük, zlib-9 + budanmış
+    L4  VectorStore (RAG)    — ChromaDB semantik arama, tüm geçmiş
 
     Ek özellikler:
     - LLM özetleme: L2 → özetle sıkıştır (token tasarrufu)
@@ -420,6 +851,7 @@ class MemoryManager:
     - Yazma tamponu: toplu commit
     - Periyodik bakım: VACUUM + WAL checkpoint + L2→L3 taşıma
     - Gerçek zamanlı metrikler
+    - RAG: Semantik benzerlik ile geçmiş bağlam çekme
     """
 
     def __init__(
@@ -449,9 +881,20 @@ class MemoryManager:
         self._metrics: Dict[str, Any] = defaultdict(int)
         self._metrics["start_time"] = time.time()
 
+        # RAG — Vektör bellek (L4)
+        if RAG_ENABLED:
+            self._rag = VectorStore(
+                persist_dir=RAG_DIR,
+                collection_name=RAG_COLLECTION,
+                llm_port=llm_port,
+            )
+        else:
+            self._rag = None
+
         self._init_schema()
         self._start_workers()
-        log.info(f"MemoryManager hazır → {self.db_path}")
+        log.info(f"MemoryManager hazır → {self.db_path}"
+                 f" | RAG: {'✓' if self._rag and self._rag.available else '✗'}")
 
     # ── Şema ────────────────────────────────────────────────
 
@@ -631,7 +1074,7 @@ class MemoryManager:
     # ── Mesaj Yazma ─────────────────────────────────────────
 
     def save_message(self, chat_id: str, role: str, content: str) -> None:
-        """Mesajı tampona ekle; dolunca toplu commit."""
+        """Mesajı tampona ekle; dolunca toplu commit. RAG'a da indeksle."""
         blob      = _encode(content)
         tok_est   = estimate_tokens(content)
         ts        = int(time.time())
@@ -645,6 +1088,14 @@ class MemoryManager:
             rows = self._wbuf.drain()
             if rows:
                 self._bulk_insert(rows)
+
+        # RAG indeksleme (arka plan thread'de, bloklamaz)
+        if self._rag and self._rag.available:
+            threading.Thread(
+                target=self._rag.index_message,
+                args=(chat_id, role, content, ts),
+                daemon=True,
+            ).start()
 
     def _bulk_insert(self, rows: List[Tuple]) -> None:
         with self._wlock:
@@ -1049,6 +1500,23 @@ class MemoryManager:
                 )
                 archived = len(ids)
 
+                # Arşivlenen mesajları RAG'a indeksle
+                if self._rag and self._rag.available:
+                    rag_batch = []
+                    for r in old:
+                        text = _decode(r["content"])
+                        if text and len(text.strip()) >= 20:
+                            rag_batch.append({
+                                "chat_id": r["chat_id"],
+                                "role": r["role"],
+                                "content": text,
+                                "ts": r["ts"],
+                                "msg_id": r["id"],
+                            })
+                    if rag_batch:
+                        indexed = self._rag.index_messages_batch(rag_batch)
+                        log.info(f"RAG: Bakım sırasında {indexed} arşiv parçası indekslendi")
+
             # Rate log temizliği (48 saatten eski)
             cutoff_rate = int(time.time()) - 48 * 3600
             conn.execute("DELETE FROM webchat_rate_log WHERE ts < ?", (cutoff_rate,))
@@ -1151,6 +1619,7 @@ class MemoryManager:
             },
             "cache": self._cache.stats(),
             "buffer": {"pending": self._wbuf.size()},
+            "rag": self.rag_stats(),
             "uptime_s": round(time.time() - self._metrics["start_time"], 0),
         }
 
@@ -1160,7 +1629,103 @@ class MemoryManager:
             cur2 = conn.execute("DELETE FROM messages_archive WHERE chat_id=?", (chat_id,))
             n = cur1.rowcount + cur2.rowcount
         self._cache.delete_prefix(f"msgs:{chat_id}")
+        # RAG vektörlerini de sil
+        if self._rag and self._rag.available:
+            self._rag.delete_chat(chat_id)
         return n
+
+    # ── RAG Yardımcıları ─────────────────────────────────────
+
+    def rag_search(self, query: str, chat_id: Optional[str] = None,
+                   k: int = RAG_TOP_K) -> List[Dict[str, Any]]:
+        """Semantik arama — VectorStore üzerinden."""
+        if not self._rag or not self._rag.available:
+            return []
+        return self._rag.search(query, chat_id=chat_id, k=k)
+
+    def rag_build_context(self, query: str, chat_id: Optional[str] = None,
+                          token_budget: int = 1024) -> str:
+        """RAG bağlam stringi oluştur — LLM prompt'una enjekte için."""
+        if not self._rag or not self._rag.available:
+            return ""
+        return self._rag.build_rag_context(query, chat_id=chat_id,
+                                           token_budget=token_budget)
+
+    def rag_stats(self) -> Dict[str, Any]:
+        """RAG istatistiklerini döndür."""
+        if not self._rag:
+            return {"available": False, "enabled": RAG_ENABLED}
+        return self._rag.get_stats()
+
+    def rag_reindex_all(self) -> Dict[str, Any]:
+        """
+        Tüm L2 + L3 mesajları yeniden indeksle.
+        Uzun sürebilir — arka plan thread'de çağrılmalı.
+        """
+        if not self._rag or not self._rag.available:
+            return {"ok": False, "error": "RAG kullanılamıyor"}
+
+        self._rag.reset()
+        conn = self._pool.get()
+
+        # L2 aktif mesajlar
+        l2_rows = conn.execute("""
+            SELECT id, chat_id, role, content, ts
+            FROM messages ORDER BY id ASC
+        """).fetchall()
+        l2_batch = []
+        for r in l2_rows:
+            text = _decode(r["content"])
+            if text and len(text.strip()) >= 20:
+                l2_batch.append({
+                    "chat_id": r["chat_id"], "role": r["role"],
+                    "content": text, "ts": r["ts"], "msg_id": r["id"],
+                })
+
+        # L3 arşiv mesajları
+        l3_rows = conn.execute("""
+            SELECT id, chat_id, role, content, ts
+            FROM messages_archive ORDER BY id ASC
+        """).fetchall()
+        l3_batch = []
+        for r in l3_rows:
+            text = _decode(r["content"])
+            if text and len(text.strip()) >= 20:
+                l3_batch.append({
+                    "chat_id": r["chat_id"], "role": r["role"],
+                    "content": text, "ts": r["ts"], "msg_id": r["id"],
+                })
+
+        total_l2 = self._rag.index_messages_batch(l2_batch) if l2_batch else 0
+        total_l3 = self._rag.index_messages_batch(l3_batch) if l3_batch else 0
+
+        result = {
+            "ok": True,
+            "l2_messages": len(l2_batch),
+            "l3_messages": len(l3_batch),
+            "l2_indexed": total_l2,
+            "l3_indexed": total_l3,
+            "total_vectors": self._rag._collection.count() if self._rag._collection else 0,
+        }
+        log.info(f"RAG reindex: {result}")
+        return result
+
+    def rag_reset(self) -> bool:
+        """RAG vektör deposunu sıfırla."""
+        if not self._rag:
+            return False
+        return self._rag.reset()
+
+    def rag_reinit(self, llm_port: int = 8080) -> bool:
+        """RAG embedding bağlantısını yeniden dene."""
+        if not self._rag:
+            if RAG_ENABLED:
+                self._rag = VectorStore(persist_dir=RAG_DIR,
+                                        collection_name=RAG_COLLECTION,
+                                        llm_port=llm_port)
+                return self._rag.available
+            return False
+        return self._rag.try_reinit(llm_port)
 
     # ── Web Chat Kullanıcı Yönetimi ──────────────────────────
 
@@ -1417,10 +1982,40 @@ app  = Flask(__name__)
 mm   = MemoryManager()
 bot  = BotMonitor(str(APP_DIR/"whatsapp_bot.js"), str(APP_DIR))
 
+# ── Request ID middleware — her isteğe benzersiz ID atayarak debug kolaylaştır ──
+@app.before_request
+def _inject_request_id():
+    request.req_id = uuid_mod.uuid4().hex[:12]
+
+@app.after_request
+def _add_request_id_header(response):
+    rid = getattr(request, 'req_id', None)
+    if rid:
+        response.headers['X-Request-ID'] = rid
+    return response
+
+# ── CORS desteği — chat_client.py farklı originden bağlanabilir ──
+@app.after_request
+def _add_cors_headers(response):
+    origin = request.headers.get('Origin', '')
+    if origin:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-API-Key'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+    return response
+
+@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
+@app.route('/<path:path>', methods=['OPTIONS'])
+def _handle_options(path):
+    return '', 204
+
 # ── İsteğe bağlı API anahtarı doğrulaması ───────────────────
 @app.before_request
 def _check_api_key():
     """PANEL_API_KEY ayarlıysa tüm /api/* yollarını koru."""
+    if request.method == 'OPTIONS':
+        return  # preflight'ları geçir
     if not PANEL_API_KEY:
         return  # auth devre dışı
     if not request.path.startswith('/api/'):
@@ -1720,6 +2315,7 @@ input:checked+.slider:before{transform:translateX(14px)}
     <div class="tab"        data-tab="params"  onclick="switchTab(this,'params')">PARAMS</div>
     <div class="tab"        data-tab="contacts"onclick="switchTab(this,'contacts')">KİŞİLER</div>
     <div class="tab"        data-tab="memory"  onclick="switchTab(this,'memory')">BELLEK</div>
+    <div class="tab"        data-tab="rag"     onclick="switchTab(this,'rag')">RAG</div>
     <div class="tab"        data-tab="webchat" onclick="switchTab(this,'webchat')">WEB</div>
     <div class="tab"        data-tab="log"     onclick="switchTab(this,'log')">LOG</div>
   </div>
@@ -1861,6 +2457,38 @@ input:checked+.slider:before{transform:translateX(14px)}
     </div>
     <div class="section-title">Cache</div>
     <div id="cache-stats" style="font-size:11px;color:var(--dim);line-height:1.8"></div>
+  </div>
+
+  <!-- RAG TAB -->
+  <div class="tab-content" id="tab-rag">
+    <div class="section-title">Vektör Bellek (RAG)</div>
+    <div class="stat-grid" id="rag-stats-grid"></div>
+    <div id="rag-progress"></div>
+
+    <div class="section-title">Semantik Arama</div>
+    <div style="background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px">
+      <div class="field" style="margin-bottom:8px"><label>Sorgu</label>
+        <div class="file-row">
+          <input type="text" id="rag-query" placeholder="Geçmiş konuşmalarda ara…"
+            onkeydown="if(event.key==='Enter')ragSearch()">
+          <button class="mini-btn" onclick="ragSearch()" style="padding:0 12px">ARA</button>
+        </div>
+      </div>
+      <div class="field" style="margin-bottom:8px"><label>Filtre: Chat ID (opsiyonel)</label>
+        <input type="text" id="rag-filter-chat" placeholder="Tüm sohbetler">
+      </div>
+    </div>
+    <div id="rag-results" style="max-height:300px;overflow-y:auto"></div>
+
+    <div class="section-title">İşlemler</div>
+    <div class="btn-row">
+      <button class="btn btn-amber" onclick="ragReindex()">📦 YENİDEN İNDEKSLE</button>
+      <button class="btn btn-outline" onclick="loadRagStats()">↺ YENİLE</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-outline" onclick="ragReinit()">🔌 Embedding Yenile</button>
+      <button class="btn btn-outline" style="color:var(--red)" onclick="ragReset()">🗑 Sıfırla</button>
+    </div>
   </div>
 
   <!-- WEBCHAT TAB -->
@@ -2011,6 +2639,7 @@ function switchTab(el, name) {
   $('tab-'+name).classList.add('active');
   if (name==='contacts') loadContacts();
   if (name==='memory')   loadMemStats();
+  if (name==='rag')      loadRagStats();
   if (name==='webchat')  loadWebchatUsers();
 }
 
@@ -2215,6 +2844,110 @@ async function runSummarize() {
   const d=await r.json();
   toast(d.ok?`Özetlendi: ${d.chats_processed} sohbet`:'Özetleme başarısız','ok');
   loadMemStats();
+}
+
+// ── RAG Yönetimi ──
+async function loadRagStats() {
+  try {
+    const r = await fetch('/api/rag/stats');
+    const d = await r.json();
+    const g = $('rag-stats-grid');
+    if (!d.ok && !d.available) {
+      g.innerHTML=`<div class="stat-card red"><div class="stat-card-label">Durum</div>
+        <div class="stat-card-value">KAPALI</div>
+        <div class="stat-card-sub">chromadb yüklü değil veya devre dışı</div></div>`;
+      $('rag-progress').innerHTML='';
+      return;
+    }
+    const avail = d.available;
+    const indexed = d.indexed||0;
+    const queries = d.queries||0;
+    const errors = d.errors||0;
+    const diskMb = d.disk_mb||0;
+    const embedType = d.embed_type||'none';
+    const embedLabel = embedType==='llm'?'LLM Lokal':embedType==='default'?'MiniLM (ONNX)':'Yok';
+
+    g.innerHTML=`
+      <div class="stat-card ${avail?'green':'red'}"><div class="stat-card-label">Durum</div>
+        <div class="stat-card-value">${avail?'AKTİF':'KAPALI'}</div>
+        <div class="stat-card-sub">${embedLabel}</div></div>
+      <div class="stat-card amber"><div class="stat-card-label">Vektörler</div>
+        <div class="stat-card-value">${indexed.toLocaleString()}</div>
+        <div class="stat-card-sub">${diskMb} MB disk</div></div>
+      <div class="stat-card blue"><div class="stat-card-label">Sorgular</div>
+        <div class="stat-card-value">${queries}</div>
+        <div class="stat-card-sub">${errors} hata</div></div>`;
+  } catch(e) {
+    $('rag-stats-grid').innerHTML=`<div class="stat-card red"><div class="stat-card-label">Hata</div>
+      <div class="stat-card-value">!</div><div class="stat-card-sub">${e.message}</div></div>`;
+  }
+}
+
+async function ragSearch() {
+  const q = $('rag-query').value.trim();
+  if (!q) { toast('Sorgu boş','err'); return; }
+  const chatFilter = $('rag-filter-chat').value.trim();
+  const url = `/api/rag/search?q=${encodeURIComponent(q)}&k=10${chatFilter?'&chat_id='+encodeURIComponent(chatFilter):''}`;
+  try {
+    const r = await fetch(url);
+    const d = await r.json();
+    const el = $('rag-results');
+    if (!d.ok) { el.innerHTML=`<div style="color:var(--red)">${d.error}</div>`; return; }
+    if (!d.results||d.results.length===0) {
+      el.innerHTML='<div style="color:var(--dim);padding:8px">Sonuç bulunamadı.</div>';
+      return;
+    }
+    el.innerHTML = d.results.map((r,i) => {
+      const ts = r.ts ? new Date(r.ts*1000).toLocaleString('tr-TR') : '?';
+      const role = r.role==='user'?'👤':'🤖';
+      const score = (r.score*100).toFixed(1);
+      const badge = r.score>=0.7?'green':r.score>=0.4?'amber':'';
+      return `<div style="background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:6px">
+        <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--dim);margin-bottom:4px">
+          <span>${role} ${r.chat_id?.substring(0,20)||'?'}</span>
+          <span>${ts}</span>
+          <span class="${badge}" style="font-weight:600">%${score}</span>
+        </div>
+        <div style="font-size:11px;line-height:1.5;color:var(--text)">${r.content?.substring(0,300)||''}${r.content?.length>300?'…':''}</div>
+      </div>`;
+    }).join('');
+  } catch(e) { toast('Arama hatası: '+e.message,'err'); }
+}
+
+async function ragReindex() {
+  if (!confirm('Tüm mesajlar yeniden indekslenecek. Bu uzun sürebilir. Devam?')) return;
+  toast('Reindex başlıyor…');
+  try {
+    const r = await fetch('/api/rag/reindex',{method:'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      toast(`Reindex tamam: L2=${d.l2_indexed} + L3=${d.l3_indexed} → ${d.total_vectors} vektör`);
+    } else {
+      toast('Reindex hatası: '+(d.error||'?'),'err');
+    }
+    loadRagStats();
+  } catch(e) { toast('Reindex hatası: '+e.message,'err'); }
+}
+
+async function ragReinit() {
+  try {
+    const port = $('port')?.value || 8080;
+    const r = await fetch('/api/rag/reinit',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({port:parseInt(port)})});
+    const d = await r.json();
+    toast(d.ok?'RAG embedding yenilendi':'RAG embedding başarısız','ok');
+    loadRagStats();
+  } catch(e) { toast('Hata: '+e.message,'err'); }
+}
+
+async function ragReset() {
+  if (!confirm('RAG vektör deposu tamamen sıfırlanacak. Emin misiniz?')) return;
+  try {
+    const r = await fetch('/api/rag/reset',{method:'DELETE'});
+    const d = await r.json();
+    toast(d.ok?'RAG sıfırlandı':'Sıfırlama hatası','ok');
+    loadRagStats();
+  } catch(e) { toast('Hata: '+e.message,'err'); }
 }
 
 // ── Web Chat Yönetimi ──
@@ -2433,16 +3166,19 @@ async function sendMsg(text) {
 
 function renderBubble(el,text,cursor){
   if (typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined') {
-    if (!marked.defaults.highlight) {
-      marked.setOptions({
-        breaks: true,
-        highlight: function(code, lang) {
-          if (lang && hljs.getLanguage(lang)) {
-            return hljs.highlight(code, { language: lang }).value;
-          }
-          return hljs.highlightAuto(code).value;
+    if (!window._markedRendererReady) {
+      const renderer = new marked.Renderer();
+      const origCode = renderer.code.bind(renderer);
+      renderer.code = function(code, lang, escaped) {
+        if (lang && hljs.getLanguage(lang)) {
+          const highlighted = hljs.highlight(code, { language: lang }).value;
+          return '<pre><code class="hljs language-' + lang + '">' + highlighted + '</code></pre>';
         }
-      });
+        const auto = hljs.highlightAuto(code).value;
+        return '<pre><code class="hljs">' + auto + '</code></pre>';
+      };
+      marked.setOptions({ breaks: true, renderer: renderer });
+      window._markedRendererReady = true;
     }
     el.innerHTML = DOMPurify.sanitize(marked.parse(text));
     el.appendChild(cursor);
@@ -2631,6 +3367,9 @@ def start_server_route():
                     r = http_req.get(f"http://127.0.0.1:{port}/health", timeout=1)
                     if r.status_code == 200:
                         _log(f"✓ LLM hazır → http://127.0.0.1:{port}", 'ok')
+                        # RAG: LLM embedding'ini yeniden dene
+                        if mm.rag_reinit(llm_port=port):
+                            _log("✓ RAG: LLM embedding aktif", 'ok')
                         return
                 except Exception: pass
             _log("LLM zaman aşımı!", 'err')
@@ -2788,6 +3527,79 @@ def clear_chat_history(chat_id: str):
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
+# ── RAG API ─────────────────────────────────────────────────
+
+@app.route('/api/rag/stats')
+def rag_stats_route():
+    """RAG vektör deposu istatistikleri."""
+    try:
+        return jsonify({"ok": True, **mm.rag_stats()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route('/api/rag/search')
+def rag_search_route():
+    """RAG semantik arama."""
+    q = request.args.get('q', '').strip()
+    if not q:
+        return jsonify({"ok": False, "error": "q parametresi gerekli"}), 400
+    chat_id = request.args.get('chat_id') or None
+    k = min(int(request.args.get('k', RAG_TOP_K)), 50)
+    try:
+        results = mm.rag_search(q, chat_id=chat_id, k=k)
+        return jsonify({"ok": True, "results": results, "count": len(results)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route('/api/rag/context')
+def rag_context_route():
+    """RAG bağlam oluştur — LLM'e enjekte edilecek metin."""
+    q = request.args.get('q', '').strip()
+    if not q:
+        return jsonify({"ok": False, "error": "q parametresi gerekli"}), 400
+    chat_id = request.args.get('chat_id') or None
+    budget = int(request.args.get('budget', 1024))
+    try:
+        ctx = mm.rag_build_context(q, chat_id=chat_id, token_budget=budget)
+        return jsonify({"ok": True, "context": ctx,
+                        "tokens_est": estimate_tokens(ctx) if ctx else 0})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route('/api/rag/reindex', methods=['POST'])
+def rag_reindex_route():
+    """Tüm L2+L3 mesajları yeniden indeksle (uzun sürebilir)."""
+    try:
+        result = mm.rag_reindex_all()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route('/api/rag/reset', methods=['DELETE'])
+def rag_reset_route():
+    """RAG vektör deposunu sıfırla."""
+    try:
+        ok = mm.rag_reset()
+        return jsonify({"ok": ok})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route('/api/rag/reinit', methods=['POST'])
+def rag_reinit_route():
+    """RAG embedding bağlantısını yeniden dene (LLM başladıktan sonra)."""
+    try:
+        port = (request.json or {}).get('port', 8080)
+        ok = mm.rag_reinit(llm_port=port)
+        return jsonify({"ok": ok, "stats": mm.rag_stats()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 # ── Contacts ────────────────────────────────────────────────
 
 @app.route('/api/contacts')
@@ -2815,13 +3627,17 @@ def toggle_contact():
 @app.route('/api/messages/save', methods=['POST'])
 def save_message_route():
     d = request.json or {}
-    chat_id = d.get('chat_id')
-    role    = d.get('role')
+    chat_id = d.get('chat_id', '')
+    role    = d.get('role', '')
     content = d.get('content', '')
     if not chat_id or not role:
         return jsonify({"ok": False, "error": "chat_id ve role zorunlu"}), 400
+    if len(chat_id) > MAX_CHAT_ID_LENGTH:
+        return jsonify({"ok": False, "error": "chat_id çok uzun"}), 400
     if role not in ('user', 'assistant', 'system', 'summary'):
         return jsonify({"ok": False, "error": f"Geçersiz rol: {role}"}), 400
+    if len(content) > MAX_MESSAGE_LENGTH:
+        content = content[:MAX_MESSAGE_LENGTH]
     try:
         mm.save_message(chat_id, role, content)
         if role == 'user':
@@ -2861,6 +3677,142 @@ def ai_enabled_route(contact_id: str):
         return jsonify({"enabled": mm.is_ai_enabled(contact_id)})
     except Exception as e:
         return jsonify({"enabled": False, "error": str(e)}), 500
+
+# ── Chat Export / Import / Search ────────────────────────────
+
+@app.route('/api/export/<chat_id>')
+def export_chat_route(chat_id: str):
+    """Sohbet geçmişini JSON olarak dışa aktar (arşiv dahil)."""
+    try:
+        if len(chat_id) > MAX_CHAT_ID_LENGTH:
+            return jsonify({"ok": False, "error": "Geçersiz chat_id"}), 400
+        limit = int(request.args.get('limit', 1000))
+        msgs = mm.get_recent_messages(chat_id, limit=limit, include_archive=True)
+        export_data = {
+            "chat_id": chat_id,
+            "exported_at": datetime.now().isoformat(),
+            "message_count": len(msgs),
+            "messages": msgs,
+        }
+        return Response(
+            json.dumps(export_data, ensure_ascii=False, indent=2),
+            content_type='application/json',
+            headers={
+                'Content-Disposition': f'attachment; filename=chat_{chat_id[:20]}_{int(time.time())}.json'
+            }
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route('/api/import', methods=['POST'])
+def import_chat_route():
+    """JSON formatında sohbet geçmişini içe aktar."""
+    try:
+        d = request.json or {}
+        chat_id = d.get('chat_id')
+        messages = d.get('messages', [])
+        if not chat_id or not messages:
+            return jsonify({"ok": False, "error": "chat_id ve messages zorunlu"}), 400
+        if len(chat_id) > MAX_CHAT_ID_LENGTH:
+            return jsonify({"ok": False, "error": "Geçersiz chat_id"}), 400
+        imported = 0
+        for msg in messages:
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+            if role in ('user', 'assistant', 'system', 'summary') and content:
+                mm.save_message(chat_id, role, content[:MAX_MESSAGE_LENGTH])
+                imported += 1
+        return jsonify({"ok": True, "imported": imported})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route('/api/search')
+def search_messages_route():
+    """Mesajlarda arama yap. query (zorunlu), chat_id (opsiyonel), limit."""
+    try:
+        query = request.args.get('q', '').strip()
+        chat_id = request.args.get('chat_id', '')
+        limit = min(int(request.args.get('limit', 50)), 200)
+        if not query or len(query) < 2:
+            return jsonify({"ok": False, "error": "En az 2 karakterlik arama terimi gerekli"}), 400
+
+        conn = mm._pool.get()
+        # Search in active messages
+        if chat_id:
+            rows = conn.execute("""
+                SELECT id, chat_id, role, content, ts FROM messages
+                WHERE chat_id = ?
+                ORDER BY ts DESC LIMIT ?
+            """, (chat_id, limit * 5)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT id, chat_id, role, content, ts FROM messages
+                ORDER BY ts DESC LIMIT ?
+            """, (limit * 5,)).fetchall()
+
+        results = []
+        q_lower = query.lower()
+        for r in rows:
+            text = _decode(r["content"])
+            if q_lower in text.lower():
+                # Arama teriminin bağlamını göster (±80 karakter)
+                idx = text.lower().find(q_lower)
+                start = max(0, idx - 80)
+                end = min(len(text), idx + len(query) + 80)
+                snippet = ('…' if start > 0 else '') + text[start:end] + ('…' if end < len(text) else '')
+                results.append({
+                    "id": r["id"],
+                    "chat_id": r["chat_id"],
+                    "role": r["role"],
+                    "snippet": snippet,
+                    "ts": r["ts"],
+                })
+                if len(results) >= limit:
+                    break
+
+        return jsonify({"ok": True, "results": results, "total": len(results)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route('/api/system/info')
+def system_info_route():
+    """Sistem bilgilerini döndür — debug ve izleme için."""
+    try:
+        import platform
+        import shutil
+
+        disk = shutil.disk_usage(str(APP_DIR))
+        stats = mm.get_stats()
+
+        return jsonify({
+            "ok": True,
+            "system": {
+                "platform": platform.platform(),
+                "python": platform.python_version(),
+                "cpu_count": os.cpu_count(),
+            },
+            "disk": {
+                "total_gb": round(disk.total / 1024**3, 2),
+                "used_gb": round(disk.used / 1024**3, 2),
+                "free_gb": round(disk.free / 1024**3, 2),
+                "used_pct": round(disk.used / disk.total * 100, 1),
+            },
+            "app": {
+                "version": "2.0.0",
+                "db_size_mb": stats.get("db", {}).get("size_mb", 0),
+                "active_messages": stats.get("messages", {}).get("active", 0),
+                "archived_messages": stats.get("messages", {}).get("archived", 0),
+                "uptime_s": stats.get("uptime_s", 0),
+                "cache_hit_rate": stats.get("cache", {}).get("hit_rate", 0),
+            },
+            "llm": _llm_status,
+            "bot": bot.status(),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 # ── Bot Control ─────────────────────────────────────────────
 
@@ -2983,6 +3935,10 @@ def webchat_chat_route():
 
     if not uid or not content:
         return jsonify({"ok": False, "error": "uid ve content zorunlu"}), 400
+    if len(content) > MAX_MESSAGE_LENGTH:
+        return jsonify({"ok": False, "error": f"Mesaj çok uzun (max {MAX_MESSAGE_LENGTH} karakter)"}), 400
+    if len(uid) > MAX_CHAT_ID_LENGTH:
+        return jsonify({"ok": False, "error": "Geçersiz kullanıcı ID"}), 400
 
     # Rate check
     rate = mm.webchat_check_rate(uid)
@@ -3075,7 +4031,20 @@ def webchat_chat_route():
     else:
         user_msg = {"role": "user", "content": content}
 
-    messages = [{"role": "system", "content": sys_prompt}] + history + [user_msg]
+    # ── RAG: Geçmiş bağlam çekme ─────────────────────────────
+    rag_context_msg = None
+    if not images:  # görsel sorgularında RAG atlansın
+        rag_ctx = mm.rag_build_context(
+            content, chat_id=chat_id,
+            token_budget=min(1024, int(max_tokens * 0.3)),
+        )
+        if rag_ctx:
+            rag_context_msg = {"role": "system", "content": rag_ctx}
+
+    messages = [{"role": "system", "content": sys_prompt}]
+    if rag_context_msg:
+        messages.append(rag_context_msg)
+    messages += history + [user_msg]
 
     def execute_tool(tool_str):
         """Araç çalıştır — sadece aktif uzmanlar çalıştırılır."""
@@ -3106,7 +4075,6 @@ def webchat_chat_route():
                 res = eval(expr_str, {"__builtins__": {}}, allowed)
                 return {"text": f"✅ Hesap Sonucu: {res}"}
             elif name == "sandbox":
-                import werkzeug.utils, subprocess, os, time as _time, base64
                 user_dir = SANDBOX_DIR / werkzeug.utils.secure_filename(uid)
                 user_dir.mkdir(parents=True, exist_ok=True)
                 path = user_dir / werkzeug.utils.secure_filename(t.get("filename", "script.py"))
@@ -3122,7 +4090,7 @@ def webchat_chat_route():
 
                 try:
                     # GUI açılması için kısa gecikme
-                    _time.sleep(1.5)
+                    time.sleep(1.5)
 
                     img_b64 = None
                     try:
@@ -3134,7 +4102,7 @@ def webchat_chat_route():
                         img_path = sc.stdout.strip()
                         if img_path and os.path.exists(img_path):
                             with open(img_path, "rb") as bf:
-                                img_b64 = base64.b64encode(bf.read()).decode('utf-8')
+                                img_b64 = b64mod.b64encode(bf.read()).decode('utf-8')
                             os.unlink(img_path)
                     except Exception:
                         pass
@@ -3425,7 +4393,6 @@ def sandbox_save():
     if not uid or not filename or content is None:
         return jsonify({"ok": False, "error": "Eksik parametreler"}), 400
     
-    import werkzeug.utils
     safe_name = werkzeug.utils.secure_filename(filename)
     if not safe_name: safe_name = f"file_{int(time.time())}.txt"
     
@@ -3443,7 +4410,6 @@ def sandbox_save():
 @app.route('/api/webchat/sandbox/list/<uid>')
 def sandbox_list(uid):
     try:
-        import werkzeug.utils
         user_dir = SANDBOX_DIR / werkzeug.utils.secure_filename(uid)
         if not user_dir.exists():
             return jsonify({"ok": True, "files": []})
@@ -3465,7 +4431,6 @@ def sandbox_list(uid):
 @app.route('/api/webchat/sandbox/<uid>/<filename>', methods=['DELETE'])
 def sandbox_delete(uid, filename):
     try:
-        import werkzeug.utils
         user_dir = SANDBOX_DIR / werkzeug.utils.secure_filename(uid)
         filepath = user_dir / werkzeug.utils.secure_filename(filename)
         if filepath.exists() and filepath.is_file():
@@ -3479,8 +4444,6 @@ def sandbox_delete(uid, filename):
 @app.route('/api/webchat/sandbox/download/<uid>/<filename>')
 def sandbox_download(uid, filename):
     try:
-        import werkzeug.utils
-        from flask import send_from_directory
         user_dir = SANDBOX_DIR / werkzeug.utils.secure_filename(uid)
         safe_name = werkzeug.utils.secure_filename(filename)
         return send_from_directory(user_dir, safe_name, as_attachment=True)
@@ -3491,7 +4454,7 @@ def sandbox_download(uid, filename):
 
 @app.route('/api/webchat/files/upload', methods=['POST'])
 def files_upload():
-    """Base64 kodlu dosyayı kullanıcı dizinine kaydet."""
+    """Base64 kodlu dosyaı kullanıcı dizinine kaydet."""
     d = request.json or {}
     uid = d.get('uid', '')
     filename = d.get('filename', '')
@@ -3500,9 +4463,8 @@ def files_upload():
     if not uid or not filename or not data_b64:
         return jsonify({"ok": False, "error": "uid, filename ve data zorunlu"}), 400
 
-    import werkzeug.utils as wu
-    safe_uid = wu.secure_filename(uid)
-    safe_name = wu.secure_filename(filename)
+    safe_uid = werkzeug.utils.secure_filename(uid)
+    safe_name = werkzeug.utils.secure_filename(filename)
     if not safe_name:
         safe_name = f"file_{int(time.time())}.bin"
 
@@ -3513,8 +4475,7 @@ def files_upload():
 
     # Boyut kontrolü
     try:
-        import base64
-        raw = base64.b64decode(data_b64)
+        raw = b64mod.b64decode(data_b64)
     except Exception:
         return jsonify({"ok": False, "error": "Geçersiz base64 verisi"}), 400
 
@@ -3555,8 +4516,7 @@ def files_upload():
 def files_list(uid):
     """Kullanıcının yüklediği dosyaları listele."""
     try:
-        import werkzeug.utils as wu
-        user_dir = UPLOADS_DIR / wu.secure_filename(uid)
+        user_dir = UPLOADS_DIR / werkzeug.utils.secure_filename(uid)
         if not user_dir.exists():
             return jsonify({"ok": True, "files": []})
 
@@ -3571,7 +4531,7 @@ def files_list(uid):
                     "mtime": int(stat.st_mtime),
                     "is_image": ext in IMAGE_EXTENSIONS,
                     "ext": ext,
-                    "url": f"/api/webchat/files/{wu.secure_filename(uid)}/{f.name}",
+                    "url": f"/api/webchat/files/{werkzeug.utils.secure_filename(uid)}/{f.name}",
                 })
         return jsonify({"ok": True, "files": sorted(files, key=lambda x: x['mtime'], reverse=True)})
     except Exception as e:
@@ -3582,10 +4542,8 @@ def files_list(uid):
 def files_serve(uid, filename):
     """Dosyayı serve et — görseller inline, diğerleri download."""
     try:
-        import werkzeug.utils as wu
-        from flask import send_from_directory
-        user_dir = UPLOADS_DIR / wu.secure_filename(uid)
-        safe_name = wu.secure_filename(filename)
+        user_dir = UPLOADS_DIR / werkzeug.utils.secure_filename(uid)
+        safe_name = werkzeug.utils.secure_filename(filename)
         if not (user_dir / safe_name).exists():
             return jsonify({"ok": False, "error": "Dosya bulunamadı"}), 404
 
@@ -3600,9 +4558,8 @@ def files_serve(uid, filename):
 def files_delete(uid, filename):
     """Kullanıcının dosyasını sil."""
     try:
-        import werkzeug.utils as wu
-        user_dir = UPLOADS_DIR / wu.secure_filename(uid)
-        filepath = user_dir / wu.secure_filename(filename)
+        user_dir = UPLOADS_DIR / werkzeug.utils.secure_filename(uid)
+        filepath = user_dir / werkzeug.utils.secure_filename(filename)
         if filepath.exists() and filepath.is_file():
             filepath.unlink()
             return jsonify({"ok": True})
