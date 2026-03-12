@@ -45,20 +45,20 @@ LLaMA Panel is a **self-hosted AI assistant ecosystem** built by **Efe Aydın**,
 └────────────┬───────────┴──────────────────┬─────────────────┘
              │                              │
     ┌────────▼────────┐           ┌─────────▼─────────┐
-    │   Admin Panel   │           │    Web Chat UI     │
-    │   (Flask:5050)  │◄──────────│   (Flask:5051)     │
-    │                 │  REST API │                    │
-    │  • LLM Control  │           │  • User Sessions   │
-    │  • Bot Monitor  │           │  • Rate Limiting    │
-    │  • Memory Mgmt  │           │  • File Uploads     │
-    │  • SSE Stream   │           │  • Expert Tools     │
-    └────────┬────────┘           └────────────────────┘
+    │   Admin Panel   │           │    Web Chat UI    │
+    │   (Flask:5050)  │◄──────────│   (Flask:5051)    │
+    │                 │  REST API │                   │
+    │  • LLM Control  │           │  • User Sessions  │
+    │  • Bot Monitor  │           │  • Rate Limiting  │
+    │  • Memory Mgmt  │           │  • File Uploads   │
+    │  • SSE Stream   │           │  • Expert Tools   │
+    └────────┬────────┘           └───────────────────┘
              │
     ┌────────▼────────┐     ┌─────────────────────┐
     │  WhatsApp Bot   │     │   Local LLM Server  │
-    │  (Node.js)      │     │  (llama.cpp / Ollama)│
-    │                 │     │   :8080              │
-    │  • QR Auth      │────►│   OpenAI-compat API  │
+    │  (Node.js)      │     │ (llama.cpp / Ollama)│
+    │                 │     │   :8080             │
+    │  • QR Auth      │────►│   OpenAI-compat API │
     │  • Google Search│     └─────────────────────┘
     │  • Image Vision │
     └─────────────────┘
