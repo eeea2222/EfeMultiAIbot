@@ -314,7 +314,7 @@ MAIN_SERVER=http://192.168.1.5:5050
 │  ┌─────────────────────────────────────────────────────┐ │
 │  │ • zlib level-9 max compression                      │ │
 │  │ • LLM summarization before archival                 │ │
-│  │ • Still queryable via include_archive=True           │ │
+│  │ • Still queryable via include_archive=True          │ │
 │  │ • Periodic maintenance: VACUUM + WAL checkpoint     │ │
 │  └─────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────┘
