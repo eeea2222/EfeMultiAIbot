@@ -408,12 +408,14 @@ client.on('message', async msg => {
 
       // LaTeX temizliği
       reply = reply
-        .replace(/\$\$(.*?)\$\$/gs, '$1').replace(/\$(.*?)\$/g, '$1')
+        .replace(/\$\$(.*?)\$\$/gs, '$1')
+        .replace(/\$([^\s$](?:[^$]*[^\s$])?)\$/g, '$1')
         .replace(/\\text\{([^}]+)\}/g, '$1').replace(/\\boxed\{([^}]+)\}/g, '*$1*')
         .replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, '$1/$2')
         .replace(/\\sqrt\{([^}]+)\}/g, '√$1').replace(/\\cdot/g, '·')
         .replace(/\\times/g, '×').replace(/\\div/g, '÷')
-        .replace(/\\implies/g, '=>').replace(/\\[a-zA-Z]+/g, '');
+        .replace(/\\implies/g, '=>').replace(/\\[a-zA-Z]+\{([^}]+)\}/g, '$1')
+        .replace(/\\[a-zA-Z]+/g, '');
 
       // Asistan yanıtını kaydet
       await saveMsg(personId, 'assistant', reply);

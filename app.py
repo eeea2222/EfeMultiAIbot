@@ -36,6 +36,7 @@ Gereksinimler:
 #  IMPORTS
 # ═══════════════════════════════════════════════════════════════
 import argparse
+import ast
 import atexit
 import base64 as b64mod
 import glob
@@ -43,6 +44,8 @@ import hashlib
 import io
 import json
 import logging
+import math as _math_mod
+import operator
 import os
 import queue
 import re
@@ -68,6 +71,68 @@ import werkzeug.utils
 # Maksimum mesaj uzunluğu (DoS koruması)
 MAX_MESSAGE_LENGTH = 50_000  # karakter
 MAX_CHAT_ID_LENGTH = 256
+
+# ═══════════════════════════════════════════════════════════════
+#  SAFE MATH EVALUATOR (AST-based, replaces eval())
+# ═══════════════════════════════════════════════════════════════
+_SAFE_MATH_NAMES: Dict[str, Any] = {
+    k: v for k, v in _math_mod.__dict__.items() if not k.startswith("__")
+}
+_SAFE_MATH_NAMES.update({
+    "abs": abs, "round": round, "min": min, "max": max,
+    "sum": sum, "int": int, "float": float,
+})
+
+_AST_ALLOWED_OPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub,
+    ast.Mult: operator.mul, ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg, ast.UAdd: operator.pos,
+}
+
+def _safe_calc_eval(expr_str: str):
+    """AST-based allowlist evaluator — permits only numeric literals,
+    whitelisted math functions/constants, and arithmetic operators."""
+    tree = ast.parse(expr_str.strip(), mode="eval")
+
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float, complex)):
+                return node.value
+            raise ValueError(f"İzin verilmeyen sabit: {node.value!r}")
+        if isinstance(node, ast.BinOp):
+            op_fn = _AST_ALLOWED_OPS.get(type(node.op))
+            if op_fn is None:
+                raise ValueError(f"İzin verilmeyen operatör: {type(node.op).__name__}")
+            return op_fn(_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp):
+            op_fn = _AST_ALLOWED_OPS.get(type(node.op))
+            if op_fn is None:
+                raise ValueError(f"İzin verilmeyen operatör: {type(node.op).__name__}")
+            return op_fn(_eval(node.operand))
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("Yalnızca basit fonksiyon çağrılarına izin verilir")
+            fn = _SAFE_MATH_NAMES.get(node.func.id)
+            if fn is None or not callable(fn):
+                raise ValueError(f"İzin verilmeyen fonksiyon: {node.func.id}")
+            args = [_eval(a) for a in node.args]
+            return fn(*args)
+        if isinstance(node, ast.Name):
+            val = _SAFE_MATH_NAMES.get(node.id)
+            if val is None:
+                raise ValueError(f"İzin verilmeyen isim: {node.id}")
+            return val
+        if isinstance(node, ast.Tuple):
+            return tuple(_eval(e) for e in node.elts)
+        if isinstance(node, ast.List):
+            return [_eval(e) for e in node.elts]
+        raise ValueError(f"İzin verilmeyen AST düğümü: {type(node).__name__}")
+
+    return _eval(tree)
 
 # ═══════════════════════════════════════════════════════════════
 #  LOGGING
@@ -267,7 +332,7 @@ def _decode(data: bytes) -> str:
         return payload.decode("utf-8")
     except Exception as e:
         log.warning(f"_decode hatası (len={len(data)}): {e}")
-        return data.decode("utf-8", errors="replace")
+        return data[1:].decode("utf-8", errors="replace")
 
 
 def _compress_ratio(data: bytes) -> float:
@@ -1336,7 +1401,8 @@ class MemoryManager:
             from PIL import Image
             import io
             img = Image.open(io.BytesIO(raw))
-            img.thumbnail(size, Image.LANCZOS)
+            resample = getattr(Image, "Resampling", Image).LANCZOS
+            img.thumbnail(size, resample)
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=60, optimize=True)
             return buf.getvalue()
@@ -3940,6 +4006,9 @@ def webchat_chat_route():
     if len(uid) > MAX_CHAT_ID_LENGTH:
         return jsonify({"ok": False, "error": "Geçersiz kullanıcı ID"}), 400
 
+    if not _llm_status.get("running"):
+        return jsonify({"ok": False, "error": "LLM sunucusu çalışmıyor"}), 503
+
     # Rate check
     rate = mm.webchat_check_rate(uid)
     if not rate.get("allowed"):
@@ -4059,20 +4128,8 @@ def webchat_chat_route():
                 return {"text": "⚠ Python Sandbox uzmanı deaktif. Ayarlardan aktif edin."}
 
             if name == "calculator":
-                import math
-                allowed = {k: v for k, v in math.__dict__.items() if not k.startswith("__")}
-                allowed["abs"] = abs
-                allowed["round"] = round
-                allowed["min"] = min
-                allowed["max"] = max
-                allowed["sum"] = sum
-                allowed["int"] = int
-                allowed["float"] = float
                 expr_str = t.get("expr", "")
-                for blocked in ("__", "import", "exec", "eval", "open", "os.", "sys.", "getattr", "setattr"):
-                    if blocked in expr_str:
-                        return {"text": f"❌ Güvensiz ifade: '{blocked}' kullanılamaz"}
-                res = eval(expr_str, {"__builtins__": {}}, allowed)
+                res = _safe_calc_eval(expr_str)
                 return {"text": f"✅ Hesap Sonucu: {res}"}
             elif name == "sandbox":
                 user_dir = SANDBOX_DIR / werkzeug.utils.secure_filename(uid)
@@ -4130,15 +4187,8 @@ def webchat_chat_route():
 
     # ── Hesap makinesi için safe eval ──────────────────────────
     def _calc_eval(expr_str: str):
-        """Güvenli matematik eval — sadece math fonksiyonları."""
-        import math
-        allowed = {k: v for k, v in math.__dict__.items() if not k.startswith("__")}
-        for fn in (abs, round, min, max, sum, int, float):
-            allowed[fn.__name__] = fn
-        for blocked in ("__", "import", "exec", "eval", "open", "os.", "sys.", "getattr", "setattr"):
-            if blocked in expr_str:
-                raise ValueError(f"Güvensiz ifade: '{blocked}' kullanılamaz")
-        return eval(expr_str, {"__builtins__": {}}, allowed)
+        """Güvenli matematik eval — AST tabanlı allowlist."""
+        return _safe_calc_eval(expr_str)
 
     # ── Aşama 1: Gizli LLM çağrısı — math JSON extract ──────
     def _phase1_extract_math(user_text: str):
@@ -4358,6 +4408,8 @@ def webchat_chat_route():
                             break  # Normal exit
                     else:
                         # in_tool=True but stream ended without </tool> — incomplete tool call
+                        log.warning("Webchat: stream ended with unclosed <tool> tag")
+                        yield f'data: {{"choices":[{{"delta":{{"content":"\\n\\n⚠ Araç çağrısı tamamlanamadı (eksik </tool> etiketi).\\n"}}}}]}}\n\n'
                         break
                 except Exception as e:
                     log.error(f"Webchat normal stream error: {e}")
