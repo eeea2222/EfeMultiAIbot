@@ -1,4 +1,4 @@
-# 🤖 EfeMultiAIbot — Self-Hosted AI Assistant Ecosystem
+#      EfeMultiAIbot — Self-Hosted AI Assistant Ecosystem
 
 > **Admin Panel + Web Chat + WhatsApp Bot** powered by local LLMs.  
 > 3-tier intelligent memory, real-time streaming, Google search integration, image analysis, and sandboxed code execution.
