@@ -450,7 +450,7 @@ client.on('message', async msg => {
   }).catch(e => {
     botStats.errors++;
     console.error('[BOT] Queue error:', e);
-    processingChats.delete(chat.id._serialized);
+    try { processingChats.delete(chat.id._serialized); } catch { }
   });
 });
 
