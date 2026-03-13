@@ -2056,7 +2056,7 @@ def sandbox_download(uid, filename):
         headers = {'Content-Type': r.headers.get('Content-Type', 'application/octet-stream')}
         if 'Content-Disposition' in r.headers:
             headers['Content-Disposition'] = r.headers['Content-Disposition']
-        return Response(r.iter_content(chunk_size=1024), headers=headers)
+        return Response(r.iter_content(chunk_size=1024), status=r.status_code, headers=headers)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
 
@@ -2099,7 +2099,7 @@ def files_serve_proxy(uid, filename):
         headers = {'Content-Type': r.headers.get('Content-Type', 'application/octet-stream')}
         if 'Content-Disposition' in r.headers:
             headers['Content-Disposition'] = r.headers['Content-Disposition']
-        return Response(r.iter_content(chunk_size=4096), headers=headers)
+        return Response(r.iter_content(chunk_size=4096), status=r.status_code, headers=headers)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
 

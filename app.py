@@ -3328,7 +3328,8 @@ def index():
 @app.route('/health')
 def health_check():
     """Sağlık kontrolü — Nginx/Load balancer/uptime monitor için."""
-    llm_ok = _llm_status.get("running", False)
+    with _llm_lock:
+        llm_ok = _llm_status.get("running", False)
     bot_st = bot.status()
     bot_ok = bot_st.get("running", False)
     db_ok  = False
@@ -3362,7 +3363,8 @@ def _log(text: str, level: str = '') -> None:
 
 @app.route('/api/server/status')
 def server_status():
-    return jsonify(_llm_status)
+    with _llm_lock:
+        return jsonify(dict(_llm_status))
 
 
 @app.route('/api/server/start', methods=['POST'])
@@ -3453,6 +3455,7 @@ def stop_server_route():
             _llm_proc.terminate()
             try: _llm_proc.wait(timeout=5)
             except Exception: _llm_proc.kill()
+        _llm_proc = None
         _llm_status["running"] = False
     _log("LLM durduruldu.", 'warn')
     return jsonify({"ok": True})
@@ -3490,7 +3493,8 @@ def stream_logs():
 @app.route('/api/chat', methods=['POST'])
 def chat():
     data = request.json or {}
-    port = _llm_status.get("port", 8080)
+    with _llm_lock:
+        port = _llm_status.get("port", 8080)
     payload = {
         "model": "local",
         "messages": data.get("messages", []),
@@ -3523,8 +3527,9 @@ def stats_stream():
         while True:
             try:
                 stats = mm.get_stats()
-                stats["llm"] = {"running": _llm_status["running"],
-                                "port": _llm_status.get("port", 8080)}
+                with _llm_lock:
+                    stats["llm"] = {"running": _llm_status["running"],
+                                    "port": _llm_status.get("port", 8080)}
                 stats["bot"] = bot.status()
                 yield f"data: {json.dumps(stats)}\n\n"
             except Exception as e:
@@ -3541,7 +3546,8 @@ def stats_stream():
 def db_stats():
     try:
         stats = mm.get_stats()
-        stats["llm"] = _llm_status
+        with _llm_lock:
+            stats["llm"] = dict(_llm_status)
         stats["bot"] = bot.status()
         return jsonify(stats)
     except Exception as e:
@@ -3853,6 +3859,9 @@ def system_info_route():
         disk = shutil.disk_usage(str(APP_DIR))
         stats = mm.get_stats()
 
+        with _llm_lock:
+            llm_snap = dict(_llm_status)
+
         return jsonify({
             "ok": True,
             "system": {
@@ -3874,7 +3883,7 @@ def system_info_route():
                 "uptime_s": stats.get("uptime_s", 0),
                 "cache_hit_rate": stats.get("cache", {}).get("hit_rate", 0),
             },
-            "llm": _llm_status,
+            "llm": llm_snap,
             "bot": bot.status(),
         })
     except Exception as e:
@@ -4006,8 +4015,9 @@ def webchat_chat_route():
     if len(uid) > MAX_CHAT_ID_LENGTH:
         return jsonify({"ok": False, "error": "Geçersiz kullanıcı ID"}), 400
 
-    if not _llm_status.get("running"):
-        return jsonify({"ok": False, "error": "LLM sunucusu çalışmıyor"}), 503
+    with _llm_lock:
+        if not _llm_status.get("running"):
+            return jsonify({"ok": False, "error": "LLM sunucusu çalışmıyor"}), 503
 
     # Rate check
     rate = mm.webchat_check_rate(uid)
@@ -4019,7 +4029,8 @@ def webchat_chat_route():
     if not user:
         return jsonify({"ok": False, "error": "Kullanıcı bulunamadı"}), 404
 
-    port       = _llm_status.get("port", 8080)
+    with _llm_lock:
+        port = _llm_status.get("port", 8080)
     max_tokens = user.get("max_tokens", 2048)
     sys_prompt = user.get("sys_prompt") or d.get("default_sys_prompt",
         "Yardımsever, saygılı ve yetenekli bir yapay zeka asistanısın.")
