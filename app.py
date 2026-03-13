@@ -3364,7 +3364,8 @@ def _log(text: str, level: str = '') -> None:
 @app.route('/api/server/status')
 def server_status():
     with _llm_lock:
-        return jsonify(dict(_llm_status))
+        snap = dict(_llm_status)
+    return jsonify(snap)
 
 
 @app.route('/api/server/start', methods=['POST'])
