@@ -20,3 +20,4 @@ venv/
 # Uploads / generated files
 uploads/
 Sandbox/
+rag_store/

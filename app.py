@@ -557,10 +557,22 @@ class VectorStore:
     def available(self) -> bool:
         return self._available and self._collection is not None
 
+    @property
+    def count(self) -> int:
+        """Vektör deposundaki toplam belge sayısı."""
+        if not self.available:
+            return 0
+        try:
+            return self._collection.count()
+        except Exception:
+            return 0
+
     def get_stats(self) -> Dict[str, Any]:
         """RAG istatistikleri."""
-        stats = dict(self._stats)
+        with self._lock:
+            stats = dict(self._stats)
         stats["available"] = self.available
+        stats["enabled"] = RAG_ENABLED
         stats["persist_dir"] = self._persist_dir
         if self.available:
             try:
@@ -694,7 +706,7 @@ class VectorStore:
                         documents=all_docs[start:end],
                         metadatas=all_metas[start:end],
                     )
-                    total += end - start
+                    total += min(end, len(all_ids)) - start
             self._stats["indexed"] = self._collection.count()
         except Exception as e:
             self._stats["errors"] += 1
@@ -1771,7 +1783,7 @@ class MemoryManager:
             "l3_messages": len(l3_batch),
             "l2_indexed": total_l2,
             "l3_indexed": total_l3,
-            "total_vectors": self._rag._collection.count() if self._rag._collection else 0,
+            "total_vectors": self._rag.count,
         }
         log.info(f"RAG reindex: {result}")
         return result
@@ -3619,7 +3631,10 @@ def rag_search_route():
     if not q:
         return jsonify({"ok": False, "error": "q parametresi gerekli"}), 400
     chat_id = request.args.get('chat_id') or None
-    k = min(int(request.args.get('k', RAG_TOP_K)), 50)
+    try:
+        k = min(int(request.args.get('k', RAG_TOP_K)), 50)
+    except (ValueError, TypeError):
+        k = RAG_TOP_K
     try:
         results = mm.rag_search(q, chat_id=chat_id, k=k)
         return jsonify({"ok": True, "results": results, "count": len(results)})
@@ -3634,7 +3649,10 @@ def rag_context_route():
     if not q:
         return jsonify({"ok": False, "error": "q parametresi gerekli"}), 400
     chat_id = request.args.get('chat_id') or None
-    budget = int(request.args.get('budget', 1024))
+    try:
+        budget = int(request.args.get('budget', 1024))
+    except (ValueError, TypeError):
+        budget = 1024
     try:
         ctx = mm.rag_build_context(q, chat_id=chat_id, token_budget=budget)
         return jsonify({"ok": True, "context": ctx,
