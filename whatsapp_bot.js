@@ -300,10 +300,10 @@ client.on('message', async msg => {
 
   llmQueue = llmQueue.then(async () => {
     try {
-    const contact = await msg.getContact();
-    const sender = contact.pushname || contact.name || 'Kullanıcı';
-    const enhanced = `[${sender}]: ${prompt}`;
-    const lower = prompt.toLowerCase();
+      const contact = await msg.getContact();
+      const sender = contact.pushname || contact.name || 'Kullanıcı';
+      const enhanced = `[${sender}]: ${prompt}`;
+      const lower = prompt.toLowerCase();
 
       // ── Bot komutları ──
       const handled = await handleCommand(msg, chat, lower, personId);
@@ -325,7 +325,7 @@ client.on('message', async msg => {
 
       const status = await getLLMStatus();
       if (!status.running) {
-        await msg.reply('Model kapalı. Panel: http://localhost:5050'); return;
+        await msg.reply(`Model kapalı. Panel: ${PANEL}`); return;
       }
       const llamaUrl = `http://127.0.0.1:${status.port}/v1/chat/completions`;
 
@@ -447,6 +447,10 @@ client.on('message', async msg => {
     } finally {
       processingChats.delete(chat.id._serialized);
     }
+  }).catch(e => {
+    botStats.errors++;
+    console.error('[BOT] Queue error:', e);
+    processingChats.delete(chat.id._serialized);
   });
 });
 
