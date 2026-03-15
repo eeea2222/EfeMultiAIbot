@@ -3503,7 +3503,7 @@ def start_server_route():
         cmd = [binary, '-m', model, '-c', str(ctx),
                '--port', str(port), '-ngl', str(ngl),
                '-t', str(threads), '-np', str(parallel),
-               '-b', '512', '-cb', '--flash-attn', '--log-disable']
+               '-b', '512', '-cb', '--flash-attn', 'auto', '--log-disable']
         if mmproj:
             cmd.extend(['--mmproj', mmproj])
 
