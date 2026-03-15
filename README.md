@@ -92,6 +92,9 @@ LLaMA Panel is a **self-hosted AI assistant ecosystem** built by **Efe Aydın**,
 - **AI Expert Tools**:
   - 🧮 **Calculator**: Precise mathematical computations via double-prompt architecture
   - 💻 **Python Sandbox**: Execute Python code in isolated environment with screenshot capture
+  - 🌐 **Web Search**: Real-time internet search via DuckDuckGo (no API key required)
+  - 🧠 **Agentic Mode**: Multi-step reasoning with Analyze → Plan → Execute → Verify cycle
+- **Date/Time Awareness**: Current date/time injected into system prompt for temporal context
 - **Responsive Design**: Fully optimized for mobile, tablet, and desktop with touch support
 - **Markdown Rendering**: Full markdown support with syntax-highlighted code blocks (highlight.js)
 
