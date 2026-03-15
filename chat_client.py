@@ -707,12 +707,24 @@ body{height:100%;background:var(--ink);color:var(--paper);
 <!-- SETTINGS MODAL -->
 <div class="modal-backdrop" id="settings-modal" style="display:none" onclick="if(event.target===this)closeSettingsModal()">
   <div class="modal">
-    <div class="modal-title">AI Uzmanları</div>
+    <div class="modal-title">AI Uzmanları & Mod</div>
     <div class="modal-sub">Yapay zekaya yeni yetenekler ekle. Değişiklikler anında kaydedilir.</div>
     <div class="settings-beta-warn">
       <b style="color:#f39c12">⚠ DİKKAT (BETA)</b><br>
       Uzmanlar yapay zekanın gerçek dünyada işlem yapmasını sağlar (örn. Sandbox içinde Python kodu çalıştırmak). Test aşamasındadır, lütfen dikkatli kullanın!
     </div>
+    
+    <div style="margin:10px 0 6px;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Mod</div>
+    
+    <div class="setting-row">
+      <div class="setting-info">
+        <div class="setting-title">Agentic Mod 🧠</div>
+        <div class="setting-desc">Çok adımlı akıl yürütme: Analiz → Plan → Uygula → Doğrula. Araçları zincirleyerek karmaşık görevleri çözer.</div>
+      </div>
+      <div class="toggle-switch" id="toggle-agentic" onclick="toggleExpert('agentic')"></div>
+    </div>
+    
+    <div style="margin:10px 0 6px;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Araçlar</div>
     
     <div class="setting-row">
       <div class="setting-info">
@@ -728,6 +740,14 @@ body{height:100%;background:var(--ink);color:var(--paper);
         <div class="setting-desc">Gerçek Python kodunu Sandbox'ta saklar ve çalıştırır.</div>
       </div>
       <div class="toggle-switch" id="toggle-sandbox" onclick="toggleExpert('sandbox')"></div>
+    </div>
+    
+    <div class="setting-row">
+      <div class="setting-info">
+        <div class="setting-title">Web Arama 🌐</div>
+        <div class="setting-desc">Güncel bilgiler için internette arama yapar (haberler, fiyatlar, hava durumu vb.)</div>
+      </div>
+      <div class="toggle-switch" id="toggle-web_search" onclick="toggleExpert('web_search')"></div>
     </div>
     
     <button class="modal-btn" onclick="closeSettingsModal()">Kapat</button>
@@ -1573,11 +1593,13 @@ async function fetchSettings(){
     const d = await r.json();
     if(d.ok && d.experts){
       currentExperts = JSON.parse(d.experts);
-      if(currentExperts.calculator) $('toggle-calculator').classList.add('on');
-      else $('toggle-calculator').classList.remove('on');
-      
-      if(currentExperts.sandbox) $('toggle-sandbox').classList.add('on');
-      else $('toggle-sandbox').classList.remove('on');
+      ['calculator','sandbox','web_search','agentic'].forEach(name => {
+        const el = $('toggle-'+name);
+        if(el){
+          if(currentExperts[name]) el.classList.add('on');
+          else el.classList.remove('on');
+        }
+      });
     }
   } catch(e){}
 }

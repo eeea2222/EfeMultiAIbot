@@ -4162,6 +4162,10 @@ def webchat_chat_route():
     sys_prompt = user.get("sys_prompt") or d.get("default_sys_prompt",
         "Yardımsever, saygılı ve yetenekli bir yapay zeka asistanısın.")
 
+    # Tarih/saat bilgisi ekle
+    now_str = datetime.now().strftime("%d %B %Y, %A %H:%M")
+    sys_prompt += f"\n[Tarih: {now_str}]"
+
     experts_json = user.get("experts", "{}")
     try:
         experts_dict = json.loads(experts_json)
@@ -4169,7 +4173,8 @@ def webchat_chat_route():
         experts_dict = {}
 
     log.debug(f"webchat_chat: uid={uid}, experts={experts_dict}")
-    any_expert_active = any(experts_dict.values())
+    tool_experts = {k: v for k, v in experts_dict.items() if k != "agentic"}
+    any_expert_active = any(tool_experts.values())
 
     # ── Uzman prompt'ları: aktifse ZORUNLU, deaktifse YOK ────
     if any_expert_active:
@@ -4202,6 +4207,23 @@ def webchat_chat_route():
                 "- Dosya adını içeriğe uygun ver (örn: fibonacci.py, calculator.py)\n"
                 "- Çıktıyı görmek için print() kullan"
             )
+        if experts_dict.get("web_search"):
+            expert_sections.append(
+                "## 🌐 WEB ARAMA (AKTİF — ZORUNLU KULLANIM)\n"
+                "Güncel bilgi gerektiren sorularda (haberler, hava durumu, spor sonuçları, "
+                "fiyatlar, güncel olaylar vb.) bu aracı KULLANMAK ZORUNDASIN.\n"
+                "Bilgi eski olabilecek veya gerçek zamanlı veri gerektiren HER soruda kullan.\n"
+                "Kullanım formatı (tam olarak bu XML etiketini yaz):\n"
+                "<tool>{\"name\": \"web_search\", \"query\": \"ARAMA_SORGUSU\"}</tool>\n"
+                "Örnekler:\n"
+                "- Kullanıcı: \"Bugün hava nasıl?\" → <tool>{\"name\": \"web_search\", \"query\": \"bugün hava durumu\"}</tool>\n"
+                "- Kullanıcı: \"Bitcoin fiyatı ne?\" → <tool>{\"name\": \"web_search\", \"query\": \"bitcoin fiyatı güncel\"}</tool>\n"
+                "- Kullanıcı: \"En son haberler\" → <tool>{\"name\": \"web_search\", \"query\": \"son dakika haberleri\"}</tool>\n"
+                "Kurallar:\n"
+                "- Arama sorgusunu kısa ve öz yaz (Türkçe veya İngilizce)\n"
+                "- Arama sonuçlarını doğal dilde özetle, kaynak belirt\n"
+                "- Birden fazla arama yapabilirsin"
+            )
 
         sys_prompt += (
             "\n\n═══ AKTİF UZMANLAR VE ARAÇLAR ═══\n"
@@ -4216,6 +4238,25 @@ def webchat_chat_route():
             "\n\nÖNEMLİ: Şu anda hiçbir AI aracın/uzmanın aktif değil. "
             "<tool> etiketleri KULLANMA. Eğer kullanıcı hesaplama veya kod "
             "çalıştırma isterse, sonucu doğrudan metin olarak ver."
+        )
+
+    # ── Agentic mod: gelişmiş akıl yürütme ───────────────────
+    if experts_dict.get("agentic"):
+        sys_prompt += (
+            "\n\n═══ AGENTİK MOD (AKTİF) ═══\n"
+            "Gelişmiş akıl yürütme modundasın. Karmaşık görevlerde şu yaklaşımı kullan:\n"
+            "1. **Analiz**: Görevi alt adımlara böl\n"
+            "2. **Plan**: Her adımda hangi aracı kullanacağını belirle\n"
+            "3. **Uygula**: Araçları sırayla çağır, sonuçları değerlendir\n"
+            "4. **Doğrula**: Sonuçları kontrol et, gerekirse tekrar dene\n"
+            "5. **Sentezle**: Tüm bilgileri birleştirip kapsamlı bir cevap ver\n\n"
+            "Kurallar:\n"
+            "- Her adımda düşünce sürecini kısaca paylaş\n"
+            "- Birden fazla araç çağrısı yapabilirsin (sırayla)\n"
+            "- Emin olmadığın bilgileri web aramasıyla doğrula\n"
+            "- Hesaplamaları her zaman hesap makinesiyle yap\n"
+            "- Kod gerektiren görevlerde sandbox kullan\n"
+            "- Adım adım ilerlediğini kullanıcıya göster"
         )
 
     # History (son 10 mesaj)
@@ -4253,6 +4294,37 @@ def webchat_chat_route():
         messages.append(rag_context_msg)
     messages += history + [user_msg]
 
+    def _execute_web_search(query: str) -> dict:
+        """DuckDuckGo HTML arama — API anahtarı gerektirmez."""
+        try:
+            r = http_req.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query},
+                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            results = []
+            # Basit regex ile sonuç çek
+            for m in re.finditer(
+                r'<a rel="nofollow" class="result__a" href="([^"]+)"[^>]*>(.*?)</a>.*?'
+                r'<a class="result__snippet"[^>]*>(.*?)</a>',
+                r.text, re.DOTALL
+            ):
+                href, title, snippet = m.group(1), m.group(2), m.group(3)
+                title = re.sub(r'<[^>]+>', '', title).strip()
+                snippet = re.sub(r'<[^>]+>', '', snippet).strip()
+                if title:
+                    results.append(f"• {title}\n  {snippet}")
+                if len(results) >= 5:
+                    break
+            if results:
+                return {"text": f"🌐 Arama sonuçları ({query}):\n\n" + "\n\n".join(results)}
+            return {"text": f"🌐 '{query}' için sonuç bulunamadı."}
+        except Exception as e:
+            log.warning(f"Web search failed: {e}")
+            return {"text": f"❌ Arama hatası: {str(e)[:200]}"}
+
     def execute_tool(tool_str):
         """Araç çalıştır — sadece aktif uzmanlar çalıştırılır."""
         try:
@@ -4264,11 +4336,18 @@ def webchat_chat_route():
                 return {"text": "⚠ Hesap Makinesi uzmanı deaktif. Ayarlardan aktif edin."}
             if name == "sandbox" and not experts_dict.get("sandbox"):
                 return {"text": "⚠ Python Sandbox uzmanı deaktif. Ayarlardan aktif edin."}
+            if name == "web_search" and not experts_dict.get("web_search"):
+                return {"text": "⚠ Web Arama uzmanı deaktif. Ayarlardan aktif edin."}
 
             if name == "calculator":
                 expr_str = t.get("expr", "")
                 res = _safe_calc_eval(expr_str)
                 return {"text": f"✅ Hesap Sonucu: {res}"}
+            elif name == "web_search":
+                query = t.get("query", "").strip()
+                if not query:
+                    return {"text": "⚠ Arama sorgusu boş."}
+                return _execute_web_search(query)
             elif name == "sandbox":
                 user_dir = SANDBOX_DIR / werkzeug.utils.secure_filename(uid)
                 user_dir.mkdir(parents=True, exist_ok=True)
@@ -4481,8 +4560,9 @@ def webchat_chat_route():
         nonlocal full_reply
         iteration = 0
         in_tool = False
+        max_iterations = 8 if experts_dict.get("agentic") else 4
         try:
-            while iteration < 4:
+            while iteration < max_iterations:
                 iteration += 1
                 payload = {
                     "model": "local",
@@ -4525,6 +4605,11 @@ def webchat_chat_route():
                                                 tool_json = tool_buffer.split("</tool>")[0]
                                                 tool_res = execute_tool(tool_json)
                                                 msgs.append({"role": "assistant", "content": current_reply})
+
+                                                # Araç sonucunu kullanıcıya göster
+                                                res_text = tool_res.get("text", str(tool_res)) if isinstance(tool_res, dict) else str(tool_res)
+                                                summary = res_text[:300].replace('"', '\\"').replace('\n', '\\n')
+                                                yield f'data: {{"choices":[{{"delta":{{"content":"\\n\\n> 📋 **Araç Sonucu:** {summary}\\n\\n"}}}}]}}\n\n'
 
                                                 if isinstance(tool_res, dict):
                                                     arr = [{"type": "text", "text": "Tool Response:\n" + tool_res.get("text", "")}]
