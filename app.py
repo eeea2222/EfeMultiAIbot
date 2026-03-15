@@ -2411,6 +2411,30 @@ input:checked+.slider:before{transform:translateX(14px)}
     <div id="model-list" style="display:none;margin-bottom:10px">
       <div id="model-items"></div>
     </div>
+    <div class="field">
+      <label style="display:flex;align-items:center;gap:8px">
+        Multimodal Projeksiyon (mmproj)
+        <label class="switch" title="mmproj etkinleştir/devre dışı bırak">
+          <input type="checkbox" id="mmproj-enabled" onchange="onMmprojToggle()">
+          <span class="slider"></span>
+        </label>
+        <span id="mmproj-status" style="font-size:11px;color:var(--dim)">Kapalı</span>
+      </label>
+      <div id="mmproj-controls" style="display:none;margin-top:6px">
+        <select id="mmproj-select" onchange="onMmprojChange()" style="width:100%;padding:7px 10px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--fg);font-size:12px">
+          <option value="__manual__">✏️ Manuel yol gir…</option>
+        </select>
+        <div id="mmproj-manual-row" style="margin-top:6px">
+          <div class="file-row">
+            <input type="text" id="mmproj-manual" placeholder="mmproj dosya yolunu girin…">
+            <button class="mini-btn" onclick="browseMmproj()" style="padding:0 12px">TARA</button>
+          </div>
+          <div id="mmproj-browse-list" style="display:none;margin-top:4px">
+            <div id="mmproj-browse-items"></div>
+          </div>
+        </div>
+      </div>
+    </div>
     <div class="section-title">Ayarlar</div>
     <div class="field"><label>Port</label><input type="number" id="port" value="8080"></div>
     <div class="field"><label>Context (-c)</label>
@@ -2722,11 +2746,46 @@ function switchTab(el, name) {
 }
 
 // ── LLM Server ──
+function getMmprojValue() {
+  if (!$('mmproj-enabled').checked) return '';
+  const sel = $('mmproj-select').value;
+  if (sel === '__manual__') return ($('mmproj-manual').value || '').trim();
+  return sel;
+}
+function onMmprojToggle() {
+  const on = $('mmproj-enabled').checked;
+  $('mmproj-controls').style.display = on ? 'block' : 'none';
+  $('mmproj-status').textContent = on ? 'Açık' : 'Kapalı';
+  $('mmproj-status').style.color = on ? 'var(--green)' : 'var(--dim)';
+  if (on) onMmprojChange();
+}
+function onMmprojChange() {
+  const isManual = $('mmproj-select').value === '__manual__';
+  $('mmproj-manual-row').style.display = isManual ? 'block' : 'none';
+}
+async function browseMmproj() {
+  const r = await fetch('/api/mmproj?all=1');
+  const d = await r.json();
+  const list = $('mmproj-browse-list'), items = $('mmproj-browse-items');
+  items.innerHTML='';
+  if (!d.projectors || !d.projectors.length) { items.innerHTML='<div style="color:var(--dim);font-size:11px">mmproj bulunamadı</div>'; }
+  else {
+    d.projectors.forEach(p => {
+      const el = document.createElement('div');
+      el.className='model-item'; el.title=p;
+      el.textContent=p.split('/').pop();
+      el.onclick=()=>{ $('mmproj-manual').value=p; list.style.display='none'; };
+      items.appendChild(el);
+    });
+  }
+  list.style.display = list.style.display==='none' ? 'block' : 'none';
+}
 async function startServer() {
   const cfg = {
     model: $('model-path').value, port: $('port').value,
     ctx: $('ctx').value, ngl: $('ngl').value,
     threads: $('threads').value, parallel: $('parallel').value,
+    mmproj: getMmprojValue(),
   };
   $('start-btn').disabled=true; $('start-btn').textContent='⏳ BAŞLATILIYOR…';
   const r = await fetch('/api/server/start',{method:'POST',
@@ -2802,6 +2861,24 @@ statsEs.onmessage = e => {
 setInterval(()=>{ $('sb-time').textContent = new Date().toLocaleTimeString('tr-TR'); },1000);
 
 // ── Model browser ──
+async function refreshMmproj(modelPath) {
+  const sel = $('mmproj-select');
+  sel.innerHTML='<option value="__manual__">✏️ Manuel yol gir…</option>';
+  if (!modelPath) return;
+  try {
+    const r = await fetch('/api/mmproj?model='+encodeURIComponent(modelPath));
+    const d = await r.json();
+    if (d.projectors && d.projectors.length) {
+      d.projectors.forEach(p => {
+        const o = document.createElement('option');
+        o.value = p; o.textContent = p.split('/').pop();
+        sel.insertBefore(o, sel.firstElementChild);
+      });
+      sel.selectedIndex = 0;
+      onMmprojChange();
+    }
+  } catch(e) {}
+}
 async function browseModels() {
   const r = await fetch('/api/models');
   const d = await r.json();
@@ -2813,7 +2890,7 @@ async function browseModels() {
       const el = document.createElement('div');
       el.className='model-item'; el.title=m;
       el.textContent=m.split('/').pop();
-      el.onclick=()=>{ $('model-path').value=m; list.style.display='none'; };
+      el.onclick=()=>{ $('model-path').value=m; list.style.display='none'; refreshMmproj(m); };
       items.appendChild(el);
     });
   }
@@ -3394,6 +3471,7 @@ def start_server_route():
         ngl      = int(data.get('ngl', 99))
         threads  = int(data.get('threads', 8))
         parallel = int(data.get('parallel', 4))
+        mmproj_path = data.get('mmproj', '')
 
         if not os.path.exists(model):
             return jsonify({"ok": False, "error": f"Model bulunamadı: {model}"})
@@ -3414,15 +3492,15 @@ def start_server_route():
             else:
                 return jsonify({"ok": False, "error": "llama-server bulunamadı"})
 
-        projectors = glob.glob(os.path.join(os.path.dirname(model), 'mmproj-*.gguf'))
-        mmproj = projectors[0] if projectors else None
-        if mmproj:
-            _log(f"mmproj algılandı: {os.path.basename(mmproj)}", 'info')
+        mmproj = None
+        if mmproj_path and os.path.exists(mmproj_path):
+            mmproj = mmproj_path
+            _log(f"mmproj seçildi: {os.path.basename(mmproj)}", 'info')
 
         cmd = [binary, '-m', model, '-c', str(ctx),
                '--port', str(port), '-ngl', str(ngl),
                '-t', str(threads), '-np', str(parallel),
-               '-b', '512', '-cb', '--flash-attn', 'on', '--log-disable']
+               '-b', '512', '-cb', '--flash-attn', '--log-disable']
         if mmproj:
             cmd.extend(['--mmproj', mmproj])
 
@@ -3442,7 +3520,11 @@ def start_server_route():
             _log("LLM durdu.", 'warn')
 
         def _wait_ready():
-            for _ in range(40):
+            for _ in range(60):
+                if _llm_proc.poll() is not None:
+                    _log("LLM başlatılamadı — süreç çöktü!", 'err')
+                    _llm_status["running"] = False
+                    return
                 time.sleep(0.5)
                 try:
                     r = http_req.get(f"http://127.0.0.1:{port}/health", timeout=1)
@@ -3486,7 +3568,30 @@ def list_models():
         if os.path.isdir(d):
             found += glob.glob(os.path.join(d, '**/*.gguf'), recursive=True)
             found += glob.glob(os.path.join(d, '*.gguf'))
-    return jsonify({"models": sorted(set(found))})
+    models = [f for f in sorted(set(found)) if 'mmproj' not in os.path.basename(f).lower()]
+    return jsonify({"models": models})
+
+
+@app.route('/api/mmproj')
+def list_mmproj():
+    """Model dizinindeki veya tüm dizinlerdeki mmproj dosyalarını listele."""
+    model = request.args.get('model', '')
+    scan_all = request.args.get('all', '')
+    dirs = []
+    if model and os.path.exists(model):
+        dirs.append(os.path.dirname(model))
+    if scan_all:
+        dirs += [
+            os.path.expanduser("~/Downloads"), os.path.expanduser("~/Desktop"),
+            os.path.expanduser("~/models"), os.path.expanduser("~/.local/share/models"),
+            str(APP_DIR),
+        ]
+    found = []
+    for d in dirs:
+        if os.path.isdir(d):
+            found += glob.glob(os.path.join(d, '**/mmproj*.gguf'), recursive=True)
+            found += glob.glob(os.path.join(d, 'mmproj*.gguf'))
+    return jsonify({"projectors": sorted(set(found))})
 
 
 @app.route('/api/logs')
