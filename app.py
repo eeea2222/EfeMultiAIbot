@@ -3493,9 +3493,12 @@ def start_server_route():
                 return jsonify({"ok": False, "error": "llama-server bulunamadı"})
 
         mmproj = None
-        if mmproj_path and os.path.exists(mmproj_path):
-            mmproj = mmproj_path
-            _log(f"mmproj seçildi: {os.path.basename(mmproj)}", 'info')
+        if mmproj_path:
+            if os.path.exists(mmproj_path):
+                mmproj = mmproj_path
+                _log(f"mmproj seçildi: {os.path.basename(mmproj)}", 'info')
+            else:
+                _log(f"mmproj dosyası bulunamadı: {mmproj_path}", 'warn')
 
         cmd = [binary, '-m', model, '-c', str(ctx),
                '--port', str(port), '-ngl', str(ngl),
@@ -3568,7 +3571,7 @@ def list_models():
         if os.path.isdir(d):
             found += glob.glob(os.path.join(d, '**/*.gguf'), recursive=True)
             found += glob.glob(os.path.join(d, '*.gguf'))
-    models = [f for f in sorted(set(found)) if 'mmproj' not in os.path.basename(f).lower()]
+    models = [f for f in sorted(set(found)) if not os.path.basename(f).lower().startswith('mmproj')]
     return jsonify({"models": models})
 
 
