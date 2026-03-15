@@ -3519,14 +3519,18 @@ def start_server_route():
             for line in _llm_proc.stdout:
                 line = line.rstrip()
                 if line: _log(line)
-            _llm_status["running"] = False
-            _log("LLM durdu.", 'warn')
+            with _llm_lock:
+                # Sadece hâlâ "running" ise uyar; stop_server_route zaten kapadıysa tekrar loglamaya gerek yok
+                if _llm_status.get("running"):
+                    _llm_status["running"] = False
+                    _log("LLM durdu.", 'warn')
 
         def _wait_ready():
             for _ in range(60):
                 if _llm_proc.poll() is not None:
                     _log("LLM başlatılamadı — süreç çöktü!", 'err')
-                    _llm_status["running"] = False
+                    with _llm_lock:
+                        _llm_status["running"] = False
                     return
                 time.sleep(0.5)
                 try:
@@ -3548,15 +3552,18 @@ def start_server_route():
 @app.route('/api/server/stop', methods=['POST'])
 def stop_server_route():
     global _llm_proc
+    was_running = False
     with _llm_lock:
         if _llm_proc and _llm_proc.poll() is None:
+            was_running = True
             _llm_proc.terminate()
             try: _llm_proc.wait(timeout=5)
             except Exception: _llm_proc.kill()
         _llm_proc = None
         _llm_status["running"] = False
         _llm_status["model"] = ""
-    _log("LLM durduruldu.", 'warn')
+    if was_running:
+        _log("LLM durduruldu.", 'warn')
     return jsonify({"ok": True})
 
 
@@ -4551,7 +4558,9 @@ def webchat_chat_route():
             if full_reply:
                 # Strip <tool>...</tool> blocks so saved history is clean for future context.
                 # Uses DOTALL so the pattern spans newlines (e.g. multi-line sandbox code).
-                clean_reply = re.sub(r'<tool>.*?</tool>', '', full_reply, flags=re.DOTALL).strip()
+                clean_reply = re.sub(r'<tool>.*?</tool>', '', full_reply, flags=re.DOTALL)
+                # Ayrıca kapanmamış <tool> etiketlerini de temizle (stream yarıda kaldıysa)
+                clean_reply = re.sub(r'<tool>.*', '', clean_reply, flags=re.DOTALL).strip()
                 if clean_reply:
                     mm.save_message(chat_id, "assistant", clean_reply)
                 mm.webchat_log_message(uid)
@@ -4632,14 +4641,44 @@ def webchat_chat_route():
                                 except Exception:
                                     pass
 
-                    if not in_tool or "</tool>" in tool_buffer:
-                        if not in_tool:
-                            break  # Normal exit
+                    if not in_tool:
+                        break  # Normal exit — araç çağrısı yok
+                    if "</tool>" in tool_buffer:
+                        pass  # Araç zaten işlendi, while döngüsüne devam et
                     else:
-                        # in_tool=True but stream ended without </tool> — incomplete tool call
-                        log.warning("Webchat: stream ended with unclosed <tool> tag")
-                        yield f'data: {{"choices":[{{"delta":{{"content":"\\n\\n⚠ Araç çağrısı tamamlanamadı (eksik </tool> etiketi).\\n"}}}}]}}\n\n'
-                        break
+                        # in_tool=True ama stream </tool> olmadan bitti — otomatik kapamayı dene
+                        tool_json = tool_buffer.strip()
+                        recovered = False
+                        for suffix in ['', '}', '"}', '"]}', '"}]}']:
+                            try:
+                                json.loads(tool_json + suffix)
+                                tool_json = tool_json + suffix
+                                recovered = True
+                                break
+                            except (json.JSONDecodeError, ValueError):
+                                continue
+                        if recovered:
+                            log.info("Webchat: unclosed <tool> tag auto-closed")
+                            tool_res = execute_tool(tool_json)
+                            msgs.append({"role": "assistant", "content": current_reply + "</tool>"})
+
+                            res_text = tool_res.get("text", str(tool_res)) if isinstance(tool_res, dict) else str(tool_res)
+                            summary = res_text[:300]
+                            sse_payload = json.dumps({"choices": [{"delta": {"content": f"\n\n> 📋 **Araç Sonucu:** {summary}\n\n"}}]})
+                            yield f"data: {sse_payload}\n\n"
+
+                            if isinstance(tool_res, dict):
+                                arr = [{"type": "text", "text": "Tool Response:\n" + tool_res.get("text", "")}]
+                                if tool_res.get("image_b64"):
+                                    arr.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{tool_res['image_b64']}"}})
+                                msgs.append({"role": "user", "content": arr})
+                            else:
+                                msgs.append({"role": "system", "content": f"Tool response: {tool_res}"})
+                            # while döngüsüne devam et (araç sonucuyla yeni istek)
+                        else:
+                            log.warning("Webchat: stream ended with unclosed <tool> tag")
+                            yield f'data: {{"choices":[{{"delta":{{"content":"\\n\\n⚠ Araç çağrısı tamamlanamadı (eksik </tool> etiketi).\\n"}}}}]}}\n\n'
+                            break
                 except Exception as e:
                     log.error(f"Webchat normal stream error: {e}")
                     yield f"data: {json.dumps({'error': str(e)[:200]})}\n\n"
