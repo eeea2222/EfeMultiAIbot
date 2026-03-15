@@ -106,10 +106,12 @@ LLaMA Panel is a **self-hosted AI assistant ecosystem** built by **Efe Aydın**,
 - **LaTeX Cleanup**: Automatic conversion of LaTeX math to WhatsApp-friendly plain text
 - **Long Message Splitting**: Auto-chunking for responses exceeding WhatsApp's 4096 character limit
 - **Agentic Mode**: Per-user switchable enhanced AI mode with custom system prompts
+- **Bot Commands**: `!help`, `!status`, `!model`, `!clear`, `!ping` for bot management
 - **Auto-Reconnect**: Exponential backoff reconnection on disconnects
 
 ### 🖥️ Admin Panel
 - **Model Management**: Start/stop LLM server, configure parameters (temperature, top_p, top_k, etc.)
+- **Multimodal Support**: mmproj projector toggle and selector UI for vision models
 - **Chat Interface**: Built-in admin chat with system prompt customization
 - **Contact Management**: View/toggle AI permissions per WhatsApp contact
 - **Bot Control**: Start/stop/restart the WhatsApp bot process with health monitoring
