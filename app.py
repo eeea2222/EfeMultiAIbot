@@ -4608,8 +4608,9 @@ def webchat_chat_route():
 
                                                 # Araç sonucunu kullanıcıya göster
                                                 res_text = tool_res.get("text", str(tool_res)) if isinstance(tool_res, dict) else str(tool_res)
-                                                summary = res_text[:300].replace('"', '\\"').replace('\n', '\\n')
-                                                yield f'data: {{"choices":[{{"delta":{{"content":"\\n\\n> 📋 **Araç Sonucu:** {summary}\\n\\n"}}}}]}}\n\n'
+                                                summary = res_text[:300]
+                                                sse_payload = json.dumps({"choices": [{"delta": {"content": f"\n\n> 📋 **Araç Sonucu:** {summary}\n\n"}}]})
+                                                yield f"data: {sse_payload}\n\n"
 
                                                 if isinstance(tool_res, dict):
                                                     arr = [{"type": "text", "text": "Tool Response:\n" + tool_res.get("text", "")}]
