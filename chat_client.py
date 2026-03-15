@@ -315,7 +315,7 @@ body{height:100%;background:var(--ink);color:var(--paper);
 .setting-desc{font-size:11.5px;color:var(--muted)}
 .toggle-switch{
   position:relative;width:40px;height:22px;background:rgba(255,255,255,.1);
-  border-radius:20px;cursor:pointer;transition:all .2s;
+  border-radius:20px;cursor:pointer;transition:all .2s;flex-shrink:0;
 }
 .toggle-switch.on{background:var(--amber)}
 .toggle-switch::after{
@@ -683,14 +683,14 @@ body{height:100%;background:var(--ink);color:var(--paper);
   <div class="preview-strip" id="preview-strip"></div>
   <div class="input-box" id="input-box">
     <button class="attach-btn" id="attach-btn" onclick="triggerFilePicker()" title="Dosya ekle (resim, belge, kod)">📎</button>
-    <textarea id="msg-input" rows="1" placeholder="Mesajını yaz… (Enter gönderin, Shift+Enter yeni satır)"></textarea>
+    <textarea id="msg-input" rows="1" placeholder="Mesajını yaz… (Enter gönderin, Shift+Enter yeni satır)" maxlength="50000"></textarea>
     <button class="send-btn" id="send-btn" onclick="handleSend()" title="Gönder">
       <svg id="send-icon" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
     </button>
   </div>
   <input type="file" id="file-picker" style="display:none" multiple
     accept="image/*,.pdf,.txt,.md,.csv,.py,.js,.ts,.html,.css,.json,.xml,.yaml,.yml,.c,.cpp,.h,.java,.rs,.go,.sh,.sql,.doc,.docx,.rtf">
-  <div class="input-hint"><span class="desktop-hint">Enter → Gönder &nbsp;·&nbsp; Shift+Enter → Satır &nbsp;·&nbsp; 📎 Dosya ekle &nbsp;·&nbsp; Esc → Durdur</span><span class="mobile-hint">Mesajını yaz ve gönder butonuna bas</span></div>
+  <div class="input-hint"><span class="desktop-hint">Enter → Gönder &nbsp;·&nbsp; Shift+Enter → Satır &nbsp;·&nbsp; 📎 Dosya ekle &nbsp;·&nbsp; Esc → Durdur</span><span class="mobile-hint">Mesajını yaz ve gönder butonuna bas</span><span id="char-counter" style="float:right;font-size:10px;color:var(--muted);display:none">0</span></div>
 </div>
 
 <!-- USERNAME MODAL -->
@@ -1472,6 +1472,7 @@ async function sendMessage(text){
               flushTokenBuffer();
             } else if(j.status === 'skip'){
               // Math yoktu — normal akışa geç
+              countdownDone = true;
               hideThinkingBubble();
               if(!asstBubble){
                 asstBubble = appendBubble('assistant', '', null);
@@ -1574,6 +1575,10 @@ function stopGeneration(){
 $('msg-input').addEventListener('input', function(){
   this.style.height='auto';
   this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+  const counter = $('char-counter');
+  const len = this.value.length;
+  if(len > 0){ counter.style.display='inline'; counter.textContent=len.toLocaleString(); counter.style.color = len > 45000 ? 'var(--red)' : 'var(--muted)'; }
+  else counter.style.display='none';
 });
 $('msg-input').addEventListener('keydown', e=>{
   if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); handleSend(); }
