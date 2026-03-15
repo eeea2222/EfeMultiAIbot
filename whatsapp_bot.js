@@ -62,6 +62,7 @@ const HELP_TEXT = `🤖 *EfeMultiAIbot Komutları*
 📊 *Bilgi*
 • *!help* → Bu yardım mesajı
 • *!status* → Bot durumu
+• *!model* → Yüklü model bilgisi
 • *!clear* → Sohbet geçmişini temizle
 • *!ping* → Bağlantı testi
 
@@ -112,6 +113,20 @@ async function handleCommand(msg, chat, lower, personId) {
       await msg.reply(`🏓 Pong! Panel: ${latency}ms`);
     } catch {
       await msg.reply('🏓 Pong! (Panel bağlantısı yok)');
+    }
+    return true;
+  }
+  if (lower === '!model') {
+    try {
+      const st = await getLLMStatus();
+      if (st.running) {
+        const modelName = (st.model || '').split('/').pop() || 'Bilinmiyor';
+        await msg.reply(`🧠 *Yüklü Model*\n\n📦 ${modelName}\n🔌 Port: ${st.port}\n✅ Çalışıyor`);
+      } else {
+        await msg.reply('🧠 Model yüklü değil. Panel üzerinden başlatın.');
+      }
+    } catch {
+      await msg.reply('❌ Model bilgisi alınamadı.');
     }
     return true;
   }

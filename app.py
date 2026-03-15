@@ -3511,7 +3511,7 @@ def start_server_route():
         _llm_proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1)
-        _llm_status.update({"running": True, "pid": _llm_proc.pid, "port": port})
+        _llm_status.update({"running": True, "pid": _llm_proc.pid, "port": port, "model": model})
         # Update mm llm_port
         mm.llm_port = port
 
@@ -3555,6 +3555,7 @@ def stop_server_route():
             except Exception: _llm_proc.kill()
         _llm_proc = None
         _llm_status["running"] = False
+        _llm_status["model"] = ""
     _log("LLM durduruldu.", 'warn')
     return jsonify({"ok": True})
 
@@ -4315,7 +4316,7 @@ def webchat_chat_route():
                 title = re.sub(r'<[^>]+>', '', title).strip()
                 snippet = re.sub(r'<[^>]+>', '', snippet).strip()
                 if title:
-                    results.append(f"• {title}\n  {snippet}")
+                    results.append(f"• {title}\n  {snippet}\n  🔗 {href}")
                 if len(results) >= 5:
                     break
             if results:
@@ -4561,9 +4562,13 @@ def webchat_chat_route():
         iteration = 0
         in_tool = False
         max_iterations = 8 if experts_dict.get("agentic") else 4
+        is_agentic = experts_dict.get("agentic", False)
         try:
             while iteration < max_iterations:
                 iteration += 1
+                if is_agentic and iteration > 1:
+                    step_payload = json.dumps({"choices": [{"delta": {"content": f"\n\n> 🔄 **Agentic Adım {iteration}/{max_iterations}**\n\n"}}]})
+                    yield f"data: {step_payload}\n\n"
                 payload = {
                     "model": "local",
                     "messages": msgs,
